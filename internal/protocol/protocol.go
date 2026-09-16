@@ -16,10 +16,11 @@ const (
 	Version  = byte(1)
 	MaxFrame = 4 << 20 // reject oversized frames so a client cannot OOM us
 
-	OpGet    = byte(1)
-	OpSet    = byte(2)
-	OpDelete = byte(3)
-	OpHealth = byte(4)
+	OpGet        = byte(1)
+	OpSet        = byte(2)
+	OpDelete     = byte(3)
+	OpHealth     = byte(4)
+	OpInvalidate = byte(5) // key=pattern; value="prefix"|"regex"
 
 	StatusOK    = byte(0)
 	StatusMiss  = byte(1)

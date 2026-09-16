@@ -4,41 +4,76 @@
 // callers cannot mutate entries behind the lock (and so a racing caller cannot
 // observe a torn slice).
 //
-// Memory: item count is hard-capped. Expired entries are dropped on access and
-// by an optional janitor so TTL'd keys that are never read do not occupy slots
-// until LRU eviction. removeLocked nils pointers to help the GC.
+// Memory: two hard caps — item count AND approximate byte cost (key+value+
+// overhead). A single Set that would exceed maxBytes or maxValue is rejected
+// rather than admitted. LRU eviction runs until both caps are satisfied, so
+// the map cannot grow unbounded under any request pattern (the process-level
+// debug.SetMemoryLimit is a second backstop in cmd/mocache).
 package cache
 
 import (
 	"container/list"
+	"errors"
+	"regexp"
+	"strings"
 	"sync"
 	"time"
+)
+
+// entryOverhead accounts for the list element, map bucket, and struct padding
+// so byte accounting is not just len(value).
+const entryOverhead = 96
+
+var (
+	// ErrTooLarge means the entry itself cannot fit the configured caps.
+	ErrTooLarge = errors.New("mocache: entry exceeds memory limits")
+	// ErrBadPattern means a regex could not be compiled (Go's RE2 is linear-time).
+	ErrBadPattern = errors.New("mocache: invalid regex")
 )
 
 type entry struct {
 	key      string
 	value    []byte
+	cost     int64
 	expireAt time.Time // zero means no expiry
 	elem     *list.Element
 }
 
 // Stats is a point-in-time snapshot of cache counters.
 type Stats struct {
-	Hits      uint64
-	Misses    uint64
-	Evictions uint64
-	ItemCount int
+	Hits          uint64
+	Misses        uint64
+	Evictions     uint64
+	Invalidations uint64
+	ItemCount     int
+	Bytes         int64
+	MaxItems      int
+	MaxBytes      int64
+}
+
+// Limits are the hard memory bounds for one node. Zero MaxBytes/MaxValue/MaxKey
+// pick safe defaults so a misconfigured process still cannot OOM the node.
+type Limits struct {
+	MaxItems int
+	MaxBytes int64
+	MaxValue int
+	MaxKey   int
 }
 
 // Cache is a capacity-bounded in-memory LRU with optional per-key TTL.
 type Cache struct {
 	mu        sync.Mutex
-	capacity  int
+	maxItems  int
+	maxBytes  int64
+	maxValue  int
+	maxKey    int
+	nbytes    int64
 	items     map[string]*entry
 	order     *list.List // front = most recently used
 	hits      uint64
 	misses    uint64
 	evictions uint64
+	invals    uint64
 
 	janitorOnce sync.Once
 	closeOnce   sync.Once
@@ -46,20 +81,35 @@ type Cache struct {
 	janitorDone chan struct{}
 }
 
-func New(capacity int) *Cache {
-	if capacity < 1 {
-		capacity = 1
+func New(maxItems int) *Cache {
+	return NewWithLimits(Limits{MaxItems: maxItems})
+}
+
+func NewWithLimits(l Limits) *Cache {
+	if l.MaxItems < 1 {
+		l.MaxItems = 1
+	}
+	if l.MaxBytes <= 0 {
+		l.MaxBytes = 64 << 20 // 64 MiB payload budget if unset
+	}
+	if l.MaxValue <= 0 {
+		l.MaxValue = 1 << 20 // 1 MiB per value
+	}
+	if l.MaxKey <= 0 {
+		l.MaxKey = 4096
 	}
 	return &Cache{
-		capacity: capacity,
-		items:    make(map[string]*entry, capacity),
+		maxItems: l.MaxItems,
+		maxBytes: l.MaxBytes,
+		maxValue: l.MaxValue,
+		maxKey:   l.MaxKey,
+		items:    make(map[string]*entry),
 		order:    list.New(),
 	}
 }
 
 // StartJanitor periodically drops expired entries so unused TTL keys cannot
 // pin memory until they happen to be the LRU victim. interval <= 0 disables it.
-// Safe to call at most once; subsequent calls are no-ops.
 func (c *Cache) StartJanitor(interval time.Duration) {
 	if interval <= 0 {
 		return
@@ -74,7 +124,6 @@ func (c *Cache) StartJanitor(interval time.Duration) {
 // Close stops the janitor (if any). Idempotent; does not clear stored items.
 func (c *Cache) Close() {
 	c.closeOnce.Do(func() {
-		// Consume janitorOnce so a racing StartJanitor cannot spawn after drain.
 		c.janitorOnce.Do(func() {})
 		if c.stopJanitor != nil {
 			close(c.stopJanitor)
@@ -99,7 +148,19 @@ func (c *Cache) janitorLoop(interval time.Duration) {
 	}
 }
 
-func (c *Cache) Set(key string, value []byte, ttl time.Duration) {
+func costOf(key string, value []byte) int64 {
+	return int64(len(key) + len(value) + entryOverhead)
+}
+
+func (c *Cache) Set(key string, value []byte, ttl time.Duration) error {
+	if len(key) > c.maxKey || len(value) > c.maxValue {
+		return ErrTooLarge
+	}
+	newCost := costOf(key, value)
+	if newCost > c.maxBytes {
+		return ErrTooLarge
+	}
+
 	// Copy so the caller's backing array can be reused or GC'd independently.
 	v := make([]byte, len(value))
 	copy(v, value)
@@ -113,18 +174,25 @@ func (c *Cache) Set(key string, value []byte, ttl time.Duration) {
 	}
 
 	if e, ok := c.items[key]; ok {
+		c.nbytes -= e.cost
 		e.value = v
+		e.cost = newCost
 		e.expireAt = expireAt
+		c.nbytes += newCost
 		c.order.MoveToFront(e.elem)
-		return
+		c.evictWhileOverLocked()
+		return nil
 	}
 
-	if c.order.Len() >= c.capacity {
+	c.evictWhileOverLocked()
+	for (c.order.Len() >= c.maxItems || c.nbytes+newCost > c.maxBytes) && c.order.Len() > 0 {
 		c.evictLocked()
 	}
-	e := &entry{key: key, value: v, expireAt: expireAt}
+	e := &entry{key: key, value: v, cost: newCost, expireAt: expireAt}
 	e.elem = c.order.PushFront(e)
 	c.items[key] = e
+	c.nbytes += newCost
+	return nil
 }
 
 func (c *Cache) Get(key string) ([]byte, bool) {
@@ -154,19 +222,61 @@ func (c *Cache) Delete(key string) {
 	}
 }
 
+// InvalidatePrefix deletes every key that starts with prefix. Returns the count.
+func (c *Cache) InvalidatePrefix(prefix string) int {
+	if prefix == "" {
+		return 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := 0
+	for k, e := range c.items {
+		if strings.HasPrefix(k, prefix) {
+			c.removeLocked(e)
+			n++
+		}
+	}
+	c.invals += uint64(n)
+	return n
+}
+
+// InvalidateRegex deletes every key matching expr (RE2, linear time — no ReDoS).
+func (c *Cache) InvalidateRegex(expr string) (int, error) {
+	if len(expr) > 512 {
+		return 0, ErrBadPattern
+	}
+	re, err := regexp.Compile(expr)
+	if err != nil {
+		return 0, ErrBadPattern
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := 0
+	for k, e := range c.items {
+		if re.MatchString(k) {
+			c.removeLocked(e)
+			n++
+		}
+	}
+	c.invals += uint64(n)
+	return n, nil
+}
+
 func (c *Cache) Stats() Stats {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return Stats{
-		Hits:      c.hits,
-		Misses:    c.misses,
-		Evictions: c.evictions,
-		ItemCount: c.order.Len(),
+		Hits:          c.hits,
+		Misses:        c.misses,
+		Evictions:     c.evictions,
+		Invalidations: c.invals,
+		ItemCount:     c.order.Len(),
+		Bytes:         c.nbytes,
+		MaxItems:      c.maxItems,
+		MaxBytes:      c.maxBytes,
 	}
 }
 
-// purgeExpired walks the recency list once. Called from the janitor; the lock
-// is held for the walk so 100k items is a short, bounded pause.
 func (c *Cache) purgeExpired() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -178,6 +288,12 @@ func (c *Cache) purgeExpired() {
 			c.removeLocked(ent)
 		}
 		e = prev
+	}
+}
+
+func (c *Cache) evictWhileOverLocked() {
+	for (c.order.Len() > c.maxItems || c.nbytes > c.maxBytes) && c.order.Len() > 0 {
+		c.evictLocked()
 	}
 }
 
@@ -193,8 +309,10 @@ func (c *Cache) evictLocked() {
 func (c *Cache) removeLocked(e *entry) {
 	c.order.Remove(e.elem)
 	delete(c.items, e.key)
-	// Drop references so the value bytes and list element can be collected
-	// without waiting for the entry struct itself to die.
+	c.nbytes -= e.cost
+	if c.nbytes < 0 {
+		c.nbytes = 0
+	}
 	e.elem = nil
 	e.value = nil
 }

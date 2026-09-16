@@ -37,8 +37,26 @@ spec:
             - -http=:{{ .Values.ports.http }}
             - -rpc=:{{ .Values.ports.rpc }}
             - -capacity={{ .Values.capacity }}
+            - -max-bytes={{ .Values.maxBytes }}
+            - -max-value={{ .Values.maxValue }}
+            - -max-key={{ .Values.maxKey }}
+            - -mem-limit={{ .Values.memLimit }}
             - -drain={{ .Values.drain }}
             - -janitor={{ .Values.janitor }}
+            {{- if .Values.accessLog }}
+            - -access-log
+            {{- end }}
+            {{- if .Values.otel.endpoint }}
+            - -otel-endpoint={{ .Values.otel.endpoint }}
+            - -otel-service={{ .Values.otel.serviceName }}
+            {{- end }}
+          env:
+            - name: OTEL_SERVICE_NAME
+              value: {{ .Values.otel.serviceName | quote }}
+            {{- if .Values.otel.endpoint }}
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: {{ .Values.otel.endpoint | quote }}
+            {{- end }}
           ports:
             - name: http
               containerPort: {{ .Values.ports.http }}

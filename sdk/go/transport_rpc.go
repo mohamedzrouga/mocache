@@ -1,6 +1,7 @@
 package mocache
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net"
@@ -46,7 +47,7 @@ func rpcAddr(node string, port int) string {
 	return net.JoinHostPort(node, strconv.Itoa(port))
 }
 
-func (t *rpcTransport) do(node, key, opName string, req protocol.Request) (protocol.Response, error) {
+func (t *rpcTransport) do(ctx context.Context, node, key, opName string, req protocol.Request) (protocol.Response, error) {
 	t.mu.Lock()
 	if t.closed {
 		t.mu.Unlock()
@@ -58,7 +59,14 @@ func (t *rpcTransport) do(node, key, opName string, req protocol.Request) (proto
 		return protocol.Response{}, wrapErr(opName, node, key, net.ErrClosed)
 	}
 	req.ID = t.id.Add(1)
-	resp, err := rc.roundTrip(req, t.timeout)
+	timeout := t.timeout
+	if dl, ok := ctx.Deadline(); ok {
+		timeout = time.Until(dl)
+		if timeout <= 0 {
+			return protocol.Response{}, wrapErr(opName, node, key, context.DeadlineExceeded)
+		}
+	}
+	resp, err := rc.roundTrip(req, timeout)
 	if err != nil {
 		return protocol.Response{}, wrapErr(opName, node, key, err)
 	}
@@ -79,8 +87,8 @@ func errString(s string) error {
 	return stringError(s)
 }
 
-func (t *rpcTransport) Get(node, key string) ([]byte, bool, error) {
-	resp, err := t.do(node, key, "Get", protocol.Request{Op: protocol.OpGet, Key: key})
+func (t *rpcTransport) Get(ctx context.Context, node, key string) ([]byte, bool, error) {
+	resp, err := t.do(ctx, node, key, "Get", protocol.Request{Op: protocol.OpGet, Key: key})
 	if err != nil {
 		return nil, false, err
 	}
@@ -90,25 +98,35 @@ func (t *rpcTransport) Get(node, key string) ([]byte, bool, error) {
 	return resp.Value, true, nil
 }
 
-func (t *rpcTransport) Set(node, key string, value []byte, ttl time.Duration) error {
+func (t *rpcTransport) Set(ctx context.Context, node, key string, value []byte, ttl time.Duration) error {
 	var sec uint32
 	if ttl > 0 {
 		sec = uint32(ttl / time.Second)
 	}
-	_, err := t.do(node, key, "Set", protocol.Request{Op: protocol.OpSet, Key: key, Value: value, TTL: sec})
+	_, err := t.do(ctx, node, key, "Set", protocol.Request{Op: protocol.OpSet, Key: key, Value: value, TTL: sec})
 	return err
 }
 
-func (t *rpcTransport) Delete(node, key string) error {
-	_, err := t.do(node, key, "Delete", protocol.Request{Op: protocol.OpDelete, Key: key})
+func (t *rpcTransport) Delete(ctx context.Context, node, key string) error {
+	_, err := t.do(ctx, node, key, "Delete", protocol.Request{Op: protocol.OpDelete, Key: key})
 	return err
+}
+
+func (t *rpcTransport) Invalidate(ctx context.Context, node, kind, pattern string) (int, error) {
+	resp, err := t.do(ctx, node, pattern, "Invalidate", protocol.Request{
+		Op: protocol.OpInvalidate, Key: pattern, Value: []byte(kind),
+	})
+	if err != nil {
+		return 0, err
+	}
+	n, _ := strconv.Atoi(string(resp.Value))
+	return n, nil
 }
 
 func (c *rpcConn) roundTrip(req protocol.Request, timeout time.Duration) (protocol.Response, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	resp, err := c.roundTripLocked(req, timeout)
-	// One reconnect: the peer likely restarted (StatefulSet rollout / crash).
 	if err != nil && retryable(err) {
 		c.reset()
 		resp, err = c.roundTripLocked(req, timeout)
@@ -166,8 +184,8 @@ func retryable(err error) bool {
 	if errors.As(err, &te) && te.Timeout() {
 		return false
 	}
-	if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
-		return true
+	if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed)
 	}
 	var ne net.Error
 	if errors.As(err, &ne) {

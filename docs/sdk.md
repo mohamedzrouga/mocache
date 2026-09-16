@@ -1,43 +1,32 @@
 # SDKs
 
-Code lives under [`sdk/`](../sdk). Runnable samples: [`sdk/examples/`](../sdk/examples).
+Code lives under [`sdk/`](../sdk). Samples: [`sdk/examples/`](../sdk/examples).
 
 Both clients:
 
-- Hash with MD5, 100 virtual nodes by default, identical ring algorithm
-- Take a **static** node list (HTTP URLs)
-- Distinguish **miss** from **unavailable**
-- Retry a broken connection once (rolling restart / crash)
-- Expose `Close` so idle sockets are not leaked
+- Sync **and** async APIs
+- Hash with MD5, 100 virtual nodes, identical ring
+- Static node list
+- Miss vs unavailable
+- `InvalidatePrefix` / `InvalidateRegex` **broadcast to every node**
+- Close idle sockets
 
-## Go
+## Go (`github.com/med/mocache/sdk/go`)
+
+| Style | Methods |
+|---|---|
+| Sync | `Get` `Set` `Delete` `InvalidatePrefix` `InvalidateRegex` |
+| Context | `GetContext` `SetContext` … |
+| Async (channel) | `GetAsync` `SetAsync` `DeleteAsync` |
 
 ```go
-import (
-    "time"
-    mocache "github.com/med/mocache/sdk/go"
-)
-
-nodes := []string{
-    "http://cache-0.cache-headless.svc.cluster.local:8090",
-    "http://cache-1.cache-headless.svc.cluster.local:8090",
-    "http://cache-2.cache-headless.svc.cluster.local:8090",
-}
-
 c := mocache.New(nodes, mocache.WithTimeout(time.Second))
 defer c.Close()
-
-// Fast path — same node list; RPC port defaults to 8091.
-c = mocache.New(nodes, mocache.WithProtocol(mocache.ProtocolGRPC))
-
-err := c.Set("user:123", []byte("some_value"), 300*time.Second)
-val, ok, err := c.Get("user:123") // miss: nil, false, nil
-err = c.Delete("user:123")
+val, ok, err := c.Get("user:123")
+res := <-c.GetAsync(ctx, "user:123")
+n, err := c.InvalidatePrefix("user:")
+n, err = c.InvalidateRegex(`^session:`)
 ```
-
-`*mocache.OpError` wraps timeouts (`IsTimeout()`) and connection failures.
-
-Run the example:
 
 ```bash
 go run ./sdk/examples/go
@@ -45,33 +34,31 @@ go run ./sdk/examples/go
 
 ## Python
 
-Python 3.13+, stdlib only.
-
-```bash
-pip install -e sdk/python
-```
+`MoCacheClient` is blocking. `AsyncMoCacheClient` is for asyncio/FastAPI (`asyncio.to_thread` so there is no aiohttp dependency).
 
 ```python
-from mocache import MoCacheClient, MoCacheError
+from mocache import MoCacheClient, AsyncMoCacheClient
 
-nodes = [
-    "http://cache-0.cache-headless.svc.cluster.local:8090",
-    "http://cache-1.cache-headless.svc.cluster.local:8090",
-    "http://cache-2.cache-headless.svc.cluster.local:8090",
-]
+with MoCacheClient(nodes) as c:
+    c.set("user:1", "x")
+    c.invalidate_prefix("user:")
+    c.invalidate_regex(r"^sess:")
 
-with MoCacheClient(nodes, timeout=1.0) as cache:
-    cache.set("user:123", "some_value", ttl_seconds=300)
-    val = cache.get("user:123")   # None on miss
-    cache.delete("user:123")
+async with AsyncMoCacheClient(nodes) as c:
+    await c.get("user:1")
 ```
 
-`protocol="grpc"` selects unary RPC (`rpc_port=8091`).
+Examples:
 
 ```bash
-PYTHONPATH=sdk/python python3 sdk/examples/python/example.py
+PYTHONPATH=sdk/python python3 sdk/examples/python/sync.py
+PYTHONPATH=sdk/python python3 sdk/examples/python/asyncio_example.py
+pip install fastapi uvicorn
+PYTHONPATH=sdk/python uvicorn fastapi_app:app --app-dir sdk/examples/python
 ```
+
+The FastAPI sample shows a **module singleton** (`sync_singleton()`) and **`app.state.cache`** created in lifespan.
 
 ## Production guidance
 
-Treat MoCache as best-effort. On `OpError` / `MoCacheError`, fall back to the authoritative source and optionally `Set` the result. Do not fail user requests because a cache node is rolling.
+Treat MoCache as best-effort. On `OpError` / `MoCacheError`, fall back to source data. Invalidate is best-effort across nodes: a down shard is skipped from the count and the first error is returned.

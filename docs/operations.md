@@ -9,8 +9,13 @@ MoCache nodes are **stateless**. Restarts, crashes, and rolling upgrades always 
 | `-http` | `:8090` | HTTP listen address |
 | `-rpc` | `:8091` | Unary RPC listen address; empty disables |
 | `-capacity` | `100000` | Max items (LRU evicts beyond this) |
+| `-max-bytes` | `64Mi` | Max approximate payload bytes |
+| `-max-value` / `-max-key` | `1Mi` / `4Ki` | Reject oversized entries (HTTP 413) |
+| `-mem-limit` | `0` | `debug.SetMemoryLimit`; keep below cgroup memory |
 | `-drain` | `5s` | After SIGTERM: `/readyz` = 503, then wait, then close sockets |
 | `-janitor` | `30s` | Sweep expired keys; `0` disables |
+| `-access-log` | off | JSON access logs |
+| `-otel-endpoint` | `$OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP/HTTP traces; empty disables |
 
 ## Signals and drain
 

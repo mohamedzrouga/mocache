@@ -21,6 +21,7 @@ func newHashRing(nodes []string, nvirtual int) *hashRing {
 		nvirtual = 100
 	}
 	// Map last-write-wins on hash collision, matching the Python dict.
+	// The ring is built once; lookups are lock-free because the slice is immutable.
 	seen := make(map[[16]byte]string, len(nodes)*nvirtual)
 	for _, node := range nodes {
 		for i := 0; i < nvirtual; i++ {

@@ -2,6 +2,7 @@ package mocache
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,14 +15,12 @@ type httpTransport struct {
 	client *http.Client
 }
 
-func (t *httpTransport) Get(node, key string) ([]byte, bool, error) {
+func (t *httpTransport) Get(ctx context.Context, node, key string) ([]byte, bool, error) {
 	u, err := join(node, "/get", key)
 	if err != nil {
 		return nil, false, wrapErr("Get", node, key, err)
 	}
-	resp, err := t.do("Get", node, key, func() (*http.Response, error) {
-		return t.client.Get(u)
-	})
+	resp, err := t.do(ctx, "Get", node, key, http.MethodGet, u, nil, "")
 	if err != nil {
 		return nil, false, err
 	}
@@ -39,7 +38,7 @@ func (t *httpTransport) Get(node, key string) ([]byte, bool, error) {
 	return b, true, nil
 }
 
-func (t *httpTransport) Set(node, key string, value []byte, ttl time.Duration) error {
+func (t *httpTransport) Set(ctx context.Context, node, key string, value []byte, ttl time.Duration) error {
 	body, err := json.Marshal(struct {
 		Key   string `json:"key"`
 		Value string `json:"value"`
@@ -52,9 +51,7 @@ func (t *httpTransport) Set(node, key string, value []byte, ttl time.Duration) e
 	if err != nil {
 		return wrapErr("Set", node, key, err)
 	}
-	resp, err := t.do("Set", node, key, func() (*http.Response, error) {
-		return t.client.Post(u, "application/json", bytes.NewReader(body))
-	})
+	resp, err := t.do(ctx, "Set", node, key, http.MethodPost, u, body, "application/json")
 	if err != nil {
 		return err
 	}
@@ -65,18 +62,12 @@ func (t *httpTransport) Set(node, key string, value []byte, ttl time.Duration) e
 	return nil
 }
 
-func (t *httpTransport) Delete(node, key string) error {
+func (t *httpTransport) Delete(ctx context.Context, node, key string) error {
 	u, err := join(node, "/delete", key)
 	if err != nil {
 		return wrapErr("Delete", node, key, err)
 	}
-	resp, err := t.do("Delete", node, key, func() (*http.Response, error) {
-		req, err := http.NewRequest(http.MethodDelete, u, nil)
-		if err != nil {
-			return nil, err
-		}
-		return t.client.Do(req)
-	})
+	resp, err := t.do(ctx, "Delete", node, key, http.MethodDelete, u, nil, "")
 	if err != nil {
 		return err
 	}
@@ -87,16 +78,60 @@ func (t *httpTransport) Delete(node, key string) error {
 	return nil
 }
 
+func (t *httpTransport) Invalidate(ctx context.Context, node, kind, pattern string) (int, error) {
+	payload := map[string]string{}
+	if kind == "prefix" {
+		payload["prefix"] = pattern
+	} else {
+		payload["regex"] = pattern
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return 0, wrapErr("Invalidate", node, pattern, err)
+	}
+	u, err := join(node, "/invalidate", "")
+	if err != nil {
+		return 0, wrapErr("Invalidate", node, pattern, err)
+	}
+	resp, err := t.do(ctx, "Invalidate", node, pattern, http.MethodPost, u, body, "application/json")
+	if err != nil {
+		return 0, err
+	}
+	defer drainAndClose(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return 0, wrapErr("Invalidate", node, pattern, fmt.Errorf("http %d", resp.StatusCode))
+	}
+	var out struct {
+		Deleted int `json:"deleted"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&out); err != nil {
+		return 0, wrapErr("Invalidate", node, pattern, err)
+	}
+	return out.Deleted, nil
+}
+
 func (t *httpTransport) Close() error {
 	t.client.CloseIdleConnections()
 	return nil
 }
 
-// do retries once on a connection error so a rolling restart (RST after
-// keep-alive) does not surface as a hard failure. Timeouts are not retried.
-func (t *httpTransport) do(op, node, key string, fn func() (*http.Response, error)) (*http.Response, error) {
+func (t *httpTransport) do(ctx context.Context, op, node, key, method, rawURL string, body []byte, contentType string) (*http.Response, error) {
+	fn := func() (*http.Response, error) {
+		var rdr io.Reader
+		if body != nil {
+			rdr = bytes.NewReader(body)
+		}
+		req, err := http.NewRequestWithContext(ctx, method, rawURL, rdr)
+		if err != nil {
+			return nil, err
+		}
+		if contentType != "" {
+			req.Header.Set("Content-Type", contentType)
+		}
+		return t.client.Do(req)
+	}
 	resp, err := fn()
-	if err != nil && retryable(err) {
+	if err != nil && retryable(err) && ctx.Err() == nil {
 		resp, err = fn()
 	}
 	if err != nil {

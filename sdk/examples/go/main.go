@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -19,24 +20,43 @@ func main() {
 		nodes = splitComma(v)
 	}
 
-	// HTTP (default). For the fast unary RPC path:
-	//   mocache.New(nodes, mocache.WithProtocol(mocache.ProtocolGRPC))
 	client := mocache.New(nodes, mocache.WithTimeout(time.Second))
 	defer client.Close()
 
+	// Sync: blocks until timeout.
 	if err := client.Set("user:123", []byte("some_value"), 300*time.Second); err != nil {
 		log.Fatal(err)
 	}
 	val, ok, err := client.Get("user:123")
 	if err != nil {
-		log.Fatal(err) // node down / timeout — treat as miss in production
+		log.Fatal(err)
 	}
-	if ok {
-		fmt.Printf("hit: %s\n", val)
-	} else {
-		fmt.Println("miss")
+	fmt.Printf("sync hit=%v val=%s\n", ok, val)
+
+	// Context: cancellable (idiomatic Go "async").
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := client.SetContext(ctx, "order:1", []byte("x"), time.Minute); err != nil {
+		log.Fatal(err)
 	}
-	_ = client.Delete("user:123")
+
+	// Channel async: does not block the caller on the round-trip.
+	res := <-client.GetAsync(ctx, "order:1")
+	if res.Err != nil {
+		log.Fatal(res.Err)
+	}
+	fmt.Printf("async found=%v val=%s\n", res.Found, res.Value)
+
+	n, err := client.InvalidatePrefix("user:")
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("invalidated prefix=%d\n", n)
+	n, err = client.InvalidateRegex(`^order:`)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("invalidated regex=%d\n", n)
 }
 
 func splitComma(s string) []string {

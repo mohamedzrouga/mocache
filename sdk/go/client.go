@@ -2,14 +2,17 @@
 //
 // Import path: github.com/med/mocache/sdk/go
 //
-// Clients hash each key onto a static node list (no discovery) and issue
-// exactly one RPC. A cache miss is (nil, false, nil). Network/timeout failures
-// return *OpError. Close the client to drop idle HTTP/RPC connections — the
-// process does not persist cache state, so a node restart looks like a miss
-// (or a brief *OpError until the TCP session is re-established).
+// Sync methods (Get/Set/Delete) block until the node answers or the client
+// timeout fires. Context methods (*Context) are the cancellable variants.
+// Async methods (*Async) return a buffered channel and run the call in a
+// goroutine — they never block the caller on the network.
+//
+// InvalidatePrefix / InvalidateRegex are broadcast to every configured node
+// because matching keys can live on any shard of the hash ring.
 package mocache
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"sync/atomic"
@@ -17,9 +20,10 @@ import (
 )
 
 type transport interface {
-	Get(node, key string) ([]byte, bool, error)
-	Set(node, key string, value []byte, ttl time.Duration) error
-	Delete(node, key string) error
+	Get(ctx context.Context, node, key string) ([]byte, bool, error)
+	Set(ctx context.Context, node, key string, value []byte, ttl time.Duration) error
+	Delete(ctx context.Context, node, key string) error
+	Invalidate(ctx context.Context, node, kind, pattern string) (int, error)
 	Close() error
 }
 
@@ -42,6 +46,7 @@ func WithRPCPort(port int) Option {
 }
 
 type Client struct {
+	nodes    []string
 	ring     *hashRing
 	timeout  time.Duration
 	vnodes   int
@@ -52,7 +57,7 @@ type Client struct {
 }
 
 func New(nodes []string, opts ...Option) *Client {
-	c := &Client{timeout: time.Second, vnodes: 100, rpcPort: 8091}
+	c := &Client{nodes: append([]string(nil), nodes...), timeout: time.Second, vnodes: 100, rpcPort: 8091}
 	for _, opt := range opts {
 		opt(c)
 	}
@@ -62,41 +67,140 @@ func New(nodes []string, opts ...Option) *Client {
 	if c.vnodes < 1 {
 		c.vnodes = 100
 	}
-	c.ring = newHashRing(nodes, c.vnodes)
+	c.ring = newHashRing(c.nodes, c.vnodes)
 	if c.protocol == ProtocolGRPC {
-		c.tr = newRPCTransport(nodes, c.rpcPort, c.timeout)
+		c.tr = newRPCTransport(c.nodes, c.rpcPort, c.timeout)
 	} else {
 		c.tr = &httpTransport{client: &http.Client{
 			Timeout: c.timeout,
 			Transport: &http.Transport{
 				MaxIdleConnsPerHost: 16,
 				IdleConnTimeout:     90 * time.Second,
-				DisableKeepAlives:   false,
 			},
 		}}
 	}
 	return c
 }
 
+func (c *Client) opCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, ok := ctx.Deadline(); ok {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, c.timeout)
+}
+
 func (c *Client) Set(key string, value []byte, ttl time.Duration) error {
+	return c.SetContext(context.Background(), key, value, ttl)
+}
+
+func (c *Client) SetContext(ctx context.Context, key string, value []byte, ttl time.Duration) error {
 	if c.closed.Load() {
 		return wrapErr("Set", "", key, errClosed)
 	}
-	return c.tr.Set(c.ring.node(key), key, value, ttl)
+	ctx, cancel := c.opCtx(ctx)
+	defer cancel()
+	return c.tr.Set(ctx, c.ring.node(key), key, value, ttl)
 }
 
 func (c *Client) Get(key string) ([]byte, bool, error) {
+	return c.GetContext(context.Background(), key)
+}
+
+func (c *Client) GetContext(ctx context.Context, key string) ([]byte, bool, error) {
 	if c.closed.Load() {
 		return nil, false, wrapErr("Get", "", key, errClosed)
 	}
-	return c.tr.Get(c.ring.node(key), key)
+	ctx, cancel := c.opCtx(ctx)
+	defer cancel()
+	return c.tr.Get(ctx, c.ring.node(key), key)
 }
 
 func (c *Client) Delete(key string) error {
+	return c.DeleteContext(context.Background(), key)
+}
+
+func (c *Client) DeleteContext(ctx context.Context, key string) error {
 	if c.closed.Load() {
 		return wrapErr("Delete", "", key, errClosed)
 	}
-	return c.tr.Delete(c.ring.node(key), key)
+	ctx, cancel := c.opCtx(ctx)
+	defer cancel()
+	return c.tr.Delete(ctx, c.ring.node(key), key)
+}
+
+// InvalidatePrefix deletes keys starting with prefix on every node.
+func (c *Client) InvalidatePrefix(prefix string) (int, error) {
+	return c.InvalidatePrefixContext(context.Background(), prefix)
+}
+
+func (c *Client) InvalidatePrefixContext(ctx context.Context, prefix string) (int, error) {
+	return c.invalidate(ctx, "prefix", prefix)
+}
+
+// InvalidateRegex deletes keys matching expr (RE2 on the server) on every node.
+func (c *Client) InvalidateRegex(expr string) (int, error) {
+	return c.InvalidateRegexContext(context.Background(), expr)
+}
+
+func (c *Client) InvalidateRegexContext(ctx context.Context, expr string) (int, error) {
+	return c.invalidate(ctx, "regex", expr)
+}
+
+func (c *Client) invalidate(ctx context.Context, kind, pattern string) (int, error) {
+	if c.closed.Load() {
+		return 0, wrapErr("Invalidate", "", pattern, errClosed)
+	}
+	ctx, cancel := c.opCtx(ctx)
+	defer cancel()
+	total := 0
+	var first error
+	// Broadcast: a prefix/regex can match keys on any shard.
+	for _, node := range c.nodes {
+		n, err := c.tr.Invalidate(ctx, node, kind, pattern)
+		total += n
+		if err != nil && first == nil {
+			first = err
+		}
+	}
+	return total, first
+}
+
+// GetResult is delivered on GetAsync.
+type GetResult struct {
+	Value []byte
+	Found bool
+	Err   error
+}
+
+func (c *Client) GetAsync(ctx context.Context, key string) <-chan GetResult {
+	ch := make(chan GetResult, 1)
+	go func() {
+		v, ok, err := c.GetContext(ctx, key)
+		ch <- GetResult{Value: v, Found: ok, Err: err}
+		close(ch)
+	}()
+	return ch
+}
+
+func (c *Client) SetAsync(ctx context.Context, key string, value []byte, ttl time.Duration) <-chan error {
+	ch := make(chan error, 1)
+	go func() {
+		ch <- c.SetContext(ctx, key, value, ttl)
+		close(ch)
+	}()
+	return ch
+}
+
+func (c *Client) DeleteAsync(ctx context.Context, key string) <-chan error {
+	ch := make(chan error, 1)
+	go func() {
+		ch <- c.DeleteContext(ctx, key)
+		close(ch)
+	}()
+	return ch
 }
 
 func (c *Client) Close() error {

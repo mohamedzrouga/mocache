@@ -4,6 +4,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"strconv"
 	"sync"
 	"time"
 
@@ -124,9 +125,33 @@ func handleRPC(c *cache.Cache, req protocol.Request) protocol.Response {
 		if req.TTL > 0 {
 			ttl = time.Duration(req.TTL) * time.Second
 		}
-		c.Set(req.Key, req.Value, ttl)
+		if err := c.Set(req.Key, req.Value, ttl); err != nil {
+			resp.Status = protocol.StatusError
+			resp.Err = err.Error()
+		}
 	case protocol.OpDelete:
 		c.Delete(req.Key)
+	case protocol.OpInvalidate:
+		// Value selects match mode; Key holds the prefix or regex.
+		kind := string(req.Value)
+		var n int
+		var err error
+		switch kind {
+		case "prefix":
+			n = c.InvalidatePrefix(req.Key)
+		case "regex":
+			n, err = c.InvalidateRegex(req.Key)
+		default:
+			resp.Status = protocol.StatusError
+			resp.Err = "invalidate kind must be prefix or regex"
+			return resp
+		}
+		if err != nil {
+			resp.Status = protocol.StatusError
+			resp.Err = err.Error()
+			return resp
+		}
+		resp.Value = []byte(strconv.Itoa(n))
 	case protocol.OpHealth:
 		resp.Value = []byte("ok")
 	default:

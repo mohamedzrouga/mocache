@@ -1,6 +1,7 @@
 package mocache
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -118,7 +119,7 @@ func TestGRPCReconnectAfterPeerClose(t *testing.T) {
 func TestHealthzAndMetrics(t *testing.T) {
 	c := cache.New(10)
 	t.Cleanup(c.Close)
-	c.Set("a", []byte("b"), 0)
+	_ = c.Set("a", []byte("b"), 0)
 	c.Get("a")
 	c.Get("missing")
 	ts := startHTTP(t, c)
@@ -140,7 +141,7 @@ func TestHealthzAndMetrics(t *testing.T) {
 	body, _ = io.ReadAll(resp.Body)
 	resp.Body.Close()
 	s := string(body)
-	for _, want := range []string{"hits 1", "misses 1", "evictions 0", "item_count 1"} {
+	for _, want := range []string{"mocache_hits_total 1", "mocache_misses_total 1", "mocache_evictions_total 0", "mocache_items 1"} {
 		if !strings.Contains(s, want) {
 			t.Fatalf("metrics missing %q in %q", want, s)
 		}
@@ -180,6 +181,32 @@ func TestCloseThenGet(t *testing.T) {
 	_, _, err := cli.Get("x")
 	if err == nil {
 		t.Fatal("expected closed error")
+	}
+}
+
+func TestInvalidatePrefixAndAsyncGet(t *testing.T) {
+	c := cache.New(20)
+	t.Cleanup(c.Close)
+	ts := startHTTP(t, c)
+	cli := New([]string{ts.URL}, WithTimeout(2*time.Second))
+	t.Cleanup(func() { _ = cli.Close() })
+	_ = cli.Set("user:1", []byte("a"), time.Minute)
+	_ = cli.Set("user:2", []byte("b"), time.Minute)
+	_ = cli.Set("other", []byte("c"), time.Minute)
+	n, err := cli.InvalidatePrefix("user:")
+	if err != nil || n != 2 {
+		t.Fatalf("invalidate n=%d err=%v", n, err)
+	}
+	if _, ok, err := cli.Get("user:1"); err != nil || ok {
+		t.Fatal("user:1 should be gone")
+	}
+	got := <-cli.GetAsync(context.Background(), "other")
+	if got.Err != nil || !got.Found || string(got.Value) != "c" {
+		t.Fatalf("async %+v", got)
+	}
+	n, err = cli.InvalidateRegex(`^oth`)
+	if err != nil || n != 1 {
+		t.Fatalf("regex n=%d err=%v", n, err)
 	}
 }
 

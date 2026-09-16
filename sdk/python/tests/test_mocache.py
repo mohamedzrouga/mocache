@@ -121,6 +121,33 @@ class LiveServerTests(unittest.TestCase):
         finally:
             c.close()
 
+    def test_invalidate_prefix_and_regex(self) -> None:
+        c = MoCacheClient([self.http_url], timeout=2.0)
+        try:
+            c.set("user:1", "a")
+            c.set("user:2", "b")
+            c.set("other", "c")
+            self.assertEqual(c.invalidate_prefix("user:"), 2)
+            self.assertIsNone(c.get("user:1"))
+            self.assertEqual(c.get("other"), "c")
+            c.set("sess:x", "1")
+            self.assertEqual(c.invalidate_regex(r"^sess:"), 1)
+        finally:
+            c.close()
+
+    def test_async_client(self) -> None:
+        import asyncio
+
+        from mocache import AsyncMoCacheClient
+
+        async def run() -> None:
+            async with AsyncMoCacheClient([self.http_url], timeout=2.0) as c:
+                await c.set("async:k", "v")
+                self.assertEqual(await c.get("async:k"), "v")
+                self.assertEqual(await c.invalidate_prefix("async:"), 1)
+
+        asyncio.run(run())
+
 
 def _free_port() -> int:
     with socket.socket() as s:

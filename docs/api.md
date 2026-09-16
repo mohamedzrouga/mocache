@@ -7,16 +7,17 @@ Base URL: `http://<pod-dns>:8090`
 | GET | `/get?key=` | — | **200** raw value bytes; **404** absent or expired |
 | POST | `/set` | JSON `{"key": string, "value": string, "ttl_seconds": int}` | **200** empty; **400** bad JSON or empty key |
 | DELETE | `/delete?key=` | — | **200** empty (idempotent) |
+| POST | `/invalidate` | JSON `{"prefix":"user:"}` **or** `{"regex":"^user:"}` | **200** `{"deleted":N}`; **400** bad pattern |
 | GET | `/livez` | — | **200** `ok` while the process can run, **including during drain** |
 | GET | `/readyz` | — | **200** `ok` when accepting traffic; **503** during drain |
 | GET | `/healthz` | — | Same as `/readyz` (load-balancer friendly) |
-| GET | `/metrics` | — | `hits`, `misses`, `evictions`, `item_count` as plain-text counters |
+| GET | `/metrics` | — | Prometheus text (hits, bytes, histograms, Go memstats) |
 
 `/get` returns raw bytes (not JSON) on the hot path. `/set` values are JSON strings (UTF-8). For opaque bytes, use the unary RPC transport.
 
 `ttl_seconds` ≤ 0 means no expiry.
 
-Bodies are capped at 4 MiB.
+Bodies are capped at 1 MiB for JSON `/set` and 4 MiB for RPC frames. Entries larger than `-max-value` / `-max-bytes` return **413**.
 
 ## Probe mapping
 

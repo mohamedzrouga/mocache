@@ -1,8 +1,10 @@
 # SDK layout
 
-- `sdk/go` — Go client (`import "github.com/med/mocache/sdk/go"`)
-- `sdk/python` — Python 3.13 client (`from mocache import MoCacheClient`)
-- `sdk/examples/go` — runnable Go example
-- `sdk/examples/python` — runnable Python example
+- `sdk/go` — Go client, sync + context + channel-async (`import "github.com/med/mocache/sdk/go"`)
+- `sdk/python` — `MoCacheClient` (sync) and `AsyncMoCacheClient` (asyncio)
+- `sdk/examples/go` — sync, context, GetAsync, invalidate
+- `sdk/examples/python/sync.py`
+- `sdk/examples/python/asyncio_example.py`
+- `sdk/examples/python/fastapi_app.py` — singleton + `app.state`
 
-See [docs/sdk.md](../docs/sdk.md) for the API and hashing contract.
+See [docs/sdk.md](../docs/sdk.md).

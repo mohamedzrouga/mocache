@@ -60,6 +60,8 @@ spec:
             - -http=:8090
             - -rpc=:8091
             - -capacity=100000
+            - -max-bytes=268435456
+            - -mem-limit=402653184
             - -drain=5s
             - -janitor=30s
           ports:

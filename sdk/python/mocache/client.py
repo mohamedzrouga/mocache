@@ -23,7 +23,7 @@ from urllib.request import Request, urlopen
 
 _MAGIC: Final = b"MOC1"
 _VERSION: Final = 1
-_OP_GET, _OP_SET, _OP_DELETE = 1, 2, 3
+_OP_GET, _OP_SET, _OP_DELETE, _OP_INVALIDATE = 1, 2, 3, 5
 _STATUS_OK, _STATUS_MISS, _STATUS_ERROR = 0, 1, 2
 _MAX_FRAME: Final = 4 << 20
 
@@ -58,6 +58,7 @@ class HashRing:
         return int.from_bytes(hashlib.md5(s.encode("utf-8"), usedforsecurity=False).digest(), "big")
 
     def node(self, key: str) -> str:
+        """Lookup is first ring position at or after the key hash (bisect_left)."""
         if not self._keys:
             return ""
         idx = bisect_left(self._keys, self._hash(key))
@@ -67,6 +68,10 @@ class HashRing:
 
 
 class MoCacheClient:
+    """Synchronous client. Safe to share across threads (one mutex per RPC node).
+
+    For asyncio / FastAPI prefer :class:`AsyncMoCacheClient`.
+    """
     def __init__(
         self,
         nodes: list[str],
@@ -78,6 +83,7 @@ class MoCacheClient:
         if protocol not in ("http", "grpc"):
             raise ValueError("protocol must be 'http' or 'grpc'")
         self._ring = HashRing(nodes, vnodes)
+        self._nodes = list(nodes)
         self._timeout = timeout
         self._protocol = protocol
         self._rpc_port = rpc_port
@@ -124,6 +130,37 @@ class MoCacheClient:
         code, _ = self._http("DELETE", f"{node}/delete?{urlencode({'key': key})}")
         if code != 200:
             raise MoCacheError(f"DELETE {key!r} via {node}: http {code}")
+
+    def invalidate_prefix(self, prefix: str) -> int:
+        """Delete keys starting with prefix on every node. Returns total deleted."""
+        return self._invalidate("prefix", prefix)
+
+    def invalidate_regex(self, pattern: str) -> int:
+        """Delete keys matching pattern (compiled as RE2 on the server)."""
+        return self._invalidate("regex", pattern)
+
+    def _invalidate(self, kind: str, pattern: str) -> int:
+        # Broadcast: consistent hashing can place matching keys on any shard.
+        self._check_open()
+        total = 0
+        first: MoCacheError | None = None
+        for node in self._nodes:
+            try:
+                if self._protocol == "grpc":
+                    _, body = self._rpc[node].call(_OP_INVALIDATE, pattern, kind.encode())
+                    total += int(body.decode() or "0")
+                    continue
+                payload = json.dumps({kind: pattern}).encode()
+                code, body = self._http("POST", f"{node.rstrip('/')}/invalidate", payload, "application/json")
+                if code != 200:
+                    raise MoCacheError(f"invalidate via {node}: http {code}")
+                total += int(json.loads(body.decode()).get("deleted", 0))
+            except MoCacheError as e:
+                if first is None:
+                    first = e
+        if first is not None:
+            raise first
+        return total
 
     def close(self) -> None:
         with self._close_lock:

@@ -8,7 +8,9 @@ import (
 
 func TestSetGetDelete(t *testing.T) {
 	c := New(10)
-	c.Set("a", []byte("1"), 0)
+	if err := c.Set("a", []byte("1"), 0); err != nil {
+		t.Fatal(err)
+	}
 	v, ok := c.Get("a")
 	if !ok || string(v) != "1" {
 		t.Fatalf("got %q %v", v, ok)
@@ -22,7 +24,9 @@ func TestSetGetDelete(t *testing.T) {
 
 func TestTTLExpiry(t *testing.T) {
 	c := New(10)
-	c.Set("a", []byte("1"), 30*time.Millisecond)
+	if err := c.Set("a", []byte("1"), 30*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
 	if _, ok := c.Get("a"); !ok {
 		t.Fatal("expected hit before expiry")
 	}
@@ -38,10 +42,10 @@ func TestTTLExpiry(t *testing.T) {
 
 func TestLRUEviction(t *testing.T) {
 	c := New(2)
-	c.Set("a", []byte("a"), 0)
-	c.Set("b", []byte("b"), 0)
+	_ = c.Set("a", []byte("a"), 0)
+	_ = c.Set("b", []byte("b"), 0)
 	c.Get("a") // a is now most recently used
-	c.Set("c", []byte("c"), 0)
+	_ = c.Set("c", []byte("c"), 0)
 	if _, ok := c.Get("b"); ok {
 		t.Fatal("b should have been evicted")
 	}
@@ -58,8 +62,8 @@ func TestLRUEviction(t *testing.T) {
 
 func TestSetExistingDoesNotEvict(t *testing.T) {
 	c := New(1)
-	c.Set("a", []byte("1"), 0)
-	c.Set("a", []byte("2"), 0)
+	_ = c.Set("a", []byte("1"), 0)
+	_ = c.Set("a", []byte("2"), 0)
 	v, ok := c.Get("a")
 	if !ok || string(v) != "2" {
 		t.Fatalf("got %q %v", v, ok)
@@ -71,7 +75,7 @@ func TestSetExistingDoesNotEvict(t *testing.T) {
 
 func TestGetCopiesValue(t *testing.T) {
 	c := New(1)
-	c.Set("a", []byte("xyz"), 0)
+	_ = c.Set("a", []byte("xyz"), 0)
 	v, _ := c.Get("a")
 	v[0] = 'Q'
 	v2, _ := c.Get("a")
@@ -83,7 +87,7 @@ func TestGetCopiesValue(t *testing.T) {
 func TestJanitorPurgesExpired(t *testing.T) {
 	c := New(10)
 	defer c.Close()
-	c.Set("a", []byte("1"), 20*time.Millisecond)
+	_ = c.Set("a", []byte("1"), 20*time.Millisecond)
 	c.StartJanitor(10 * time.Millisecond)
 	time.Sleep(50 * time.Millisecond)
 	if c.Stats().ItemCount != 0 {
@@ -108,7 +112,7 @@ func TestConcurrent(t *testing.T) {
 			defer wg.Done()
 			for j := 0; j < 200; j++ {
 				k := string(rune('a' + (n+j)%26))
-				c.Set(k, []byte{byte(j)}, 0)
+				_ = c.Set(k, []byte{byte(j)}, 0)
 				c.Get(k)
 				if j%7 == 0 {
 					c.Delete(k)
@@ -117,4 +121,44 @@ func TestConcurrent(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
+}
+
+func TestByteCapEvictsBeforeOOM(t *testing.T) {
+	c := NewWithLimits(Limits{MaxItems: 1000, MaxBytes: 300, MaxValue: 200, MaxKey: 64})
+	defer c.Close()
+	if err := c.Set("big", make([]byte, 500), 0); err != ErrTooLarge {
+		t.Fatalf("want ErrTooLarge, got %v", err)
+	}
+	for i := 0; i < 50; i++ {
+		if err := c.Set(string(rune('a'+i%26))+string(rune('0'+i%10)), make([]byte, 40), 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st := c.Stats()
+	if st.Bytes > st.MaxBytes {
+		t.Fatalf("bytes %d > max %d", st.Bytes, st.MaxBytes)
+	}
+	if st.ItemCount > st.MaxItems {
+		t.Fatalf("items %d > max %d", st.ItemCount, st.MaxItems)
+	}
+}
+
+func TestInvalidatePrefixAndRegex(t *testing.T) {
+	c := New(10)
+	defer c.Close()
+	_ = c.Set("user:1", []byte("a"), 0)
+	_ = c.Set("user:2", []byte("b"), 0)
+	_ = c.Set("other", []byte("c"), 0)
+	if n := c.InvalidatePrefix("user:"); n != 2 {
+		t.Fatalf("prefix n=%d", n)
+	}
+	if _, ok := c.Get("other"); !ok {
+		t.Fatal("other should remain")
+	}
+	_ = c.Set("sess:aa", []byte("1"), 0)
+	_ = c.Set("sess:bb", []byte("2"), 0)
+	n, err := c.InvalidateRegex(`^sess:`)
+	if err != nil || n != 2 {
+		t.Fatalf("regex n=%d err=%v", n, err)
+	}
 }
