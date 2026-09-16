@@ -1,6 +1,8 @@
 package mocache
 
 import (
+	"errors"
+	"io"
 	"net"
 	"net/url"
 	"strconv"
@@ -16,6 +18,7 @@ type rpcTransport struct {
 	id      atomic.Uint32
 	mu      sync.Mutex
 	conns   map[string]*rpcConn
+	closed  bool
 }
 
 type rpcConn struct {
@@ -27,8 +30,7 @@ type rpcConn struct {
 func newRPCTransport(nodes []string, rpcPort int, timeout time.Duration) *rpcTransport {
 	t := &rpcTransport{timeout: timeout, conns: make(map[string]*rpcConn, len(nodes))}
 	for _, node := range nodes {
-		addr := rpcAddr(node, rpcPort)
-		t.conns[node] = &rpcConn{addr: addr}
+		t.conns[node] = &rpcConn{addr: rpcAddr(node, rpcPort)}
 	}
 	return t
 }
@@ -46,6 +48,10 @@ func rpcAddr(node string, port int) string {
 
 func (t *rpcTransport) do(node, key, opName string, req protocol.Request) (protocol.Response, error) {
 	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		return protocol.Response{}, wrapErr(opName, node, key, errClosed)
+	}
 	rc := t.conns[node]
 	t.mu.Unlock()
 	if rc == nil {
@@ -101,6 +107,16 @@ func (t *rpcTransport) Delete(node, key string) error {
 func (c *rpcConn) roundTrip(req protocol.Request, timeout time.Duration) (protocol.Response, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	resp, err := c.roundTripLocked(req, timeout)
+	// One reconnect: the peer likely restarted (StatefulSet rollout / crash).
+	if err != nil && retryable(err) {
+		c.reset()
+		resp, err = c.roundTripLocked(req, timeout)
+	}
+	return resp, err
+}
+
+func (c *rpcConn) roundTripLocked(req protocol.Request, timeout time.Duration) (protocol.Response, error) {
 	if c.conn == nil {
 		conn, err := net.DialTimeout("tcp", c.addr, timeout)
 		if err != nil {
@@ -123,17 +139,39 @@ func (c *rpcConn) roundTrip(req protocol.Request, timeout time.Duration) (protoc
 
 func (c *rpcConn) reset() {
 	if c.conn != nil {
-		c.conn.Close()
+		_ = c.conn.Close()
 		c.conn = nil
 	}
 }
 
-func (t *rpcTransport) close() {
+func (t *rpcTransport) Close() error {
 	t.mu.Lock()
-	defer t.mu.Unlock()
-	for _, c := range t.conns {
+	t.closed = true
+	conns := t.conns
+	t.conns = nil
+	t.mu.Unlock()
+	for _, c := range conns {
 		c.mu.Lock()
 		c.reset()
 		c.mu.Unlock()
 	}
+	return nil
+}
+
+func retryable(err error) bool {
+	if err == nil {
+		return false
+	}
+	var te timeoutErr
+	if errors.As(err, &te) && te.Timeout() {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	var ne net.Error
+	if errors.As(err, &ne) {
+		return !ne.Timeout()
+	}
+	return true
 }

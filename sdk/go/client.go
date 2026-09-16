@@ -1,9 +1,18 @@
 // Package mocache is the Go client SDK for MoCache.
+//
+// Import path: github.com/med/mocache/sdk/go
+//
+// Clients hash each key onto a static node list (no discovery) and issue
+// exactly one RPC. A cache miss is (nil, false, nil). Network/timeout failures
+// return *OpError. Close the client to drop idle HTTP/RPC connections — the
+// process does not persist cache state, so a node restart looks like a miss
+// (or a brief *OpError until the TCP session is re-established).
 package mocache
 
 import (
 	"errors"
 	"net/http"
+	"sync/atomic"
 	"time"
 )
 
@@ -11,6 +20,7 @@ type transport interface {
 	Get(node, key string) ([]byte, bool, error)
 	Set(node, key string, value []byte, ttl time.Duration) error
 	Delete(node, key string) error
+	Close() error
 }
 
 type Option func(*Client)
@@ -38,6 +48,7 @@ type Client struct {
 	protocol Protocol
 	rpcPort  int
 	tr       transport
+	closed   atomic.Bool
 }
 
 func New(nodes []string, opts ...Option) *Client {
@@ -60,6 +71,7 @@ func New(nodes []string, opts ...Option) *Client {
 			Transport: &http.Transport{
 				MaxIdleConnsPerHost: 16,
 				IdleConnTimeout:     90 * time.Second,
+				DisableKeepAlives:   false,
 			},
 		}}
 	}
@@ -67,20 +79,30 @@ func New(nodes []string, opts ...Option) *Client {
 }
 
 func (c *Client) Set(key string, value []byte, ttl time.Duration) error {
+	if c.closed.Load() {
+		return wrapErr("Set", "", key, errClosed)
+	}
 	return c.tr.Set(c.ring.node(key), key, value, ttl)
 }
 
 func (c *Client) Get(key string) ([]byte, bool, error) {
+	if c.closed.Load() {
+		return nil, false, wrapErr("Get", "", key, errClosed)
+	}
 	return c.tr.Get(c.ring.node(key), key)
 }
 
 func (c *Client) Delete(key string) error {
+	if c.closed.Load() {
+		return wrapErr("Delete", "", key, errClosed)
+	}
 	return c.tr.Delete(c.ring.node(key), key)
 }
 
 func (c *Client) Close() error {
-	if t, ok := c.tr.(*rpcTransport); ok {
-		t.close()
+	c.closed.Store(true)
+	if c.tr != nil {
+		return c.tr.Close()
 	}
 	return nil
 }

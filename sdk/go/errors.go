@@ -40,5 +40,11 @@ func (e *OpError) Error() string {
 
 func (e *OpError) Unwrap() error { return e.Err }
 
-// Timeout reports whether the failure was a deadline.
+// IsTimeout reports whether the failure was a deadline.
 func (e *OpError) IsTimeout() bool { return e.Timeout }
+
+type closedError struct{}
+
+func (closedError) Error() string { return "client closed" }
+
+var errClosed = closedError{}

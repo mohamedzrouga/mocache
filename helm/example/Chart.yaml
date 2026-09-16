@@ -1,0 +1,6 @@
+apiVersion: v2
+name: mocache
+description: Example Helm chart for MoCache cache nodes (StatefulSet + headless Service)
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

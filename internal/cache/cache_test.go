@@ -80,8 +80,27 @@ func TestGetCopiesValue(t *testing.T) {
 	}
 }
 
+func TestJanitorPurgesExpired(t *testing.T) {
+	c := New(10)
+	defer c.Close()
+	c.Set("a", []byte("1"), 20*time.Millisecond)
+	c.StartJanitor(10 * time.Millisecond)
+	time.Sleep(50 * time.Millisecond)
+	if c.Stats().ItemCount != 0 {
+		t.Fatalf("janitor left %d items", c.Stats().ItemCount)
+	}
+}
+
+func TestCloseIdempotent(t *testing.T) {
+	c := New(1)
+	c.StartJanitor(time.Hour)
+	c.Close()
+	c.Close()
+}
+
 func TestConcurrent(t *testing.T) {
 	c := New(1000)
+	defer c.Close()
 	var wg sync.WaitGroup
 	for i := 0; i < 8; i++ {
 		wg.Add(1)

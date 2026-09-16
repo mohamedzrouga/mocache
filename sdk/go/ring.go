@@ -11,6 +11,7 @@ type vnode struct {
 	node string
 }
 
+// hashRing is immutable after construction, so concurrent lookups need no lock.
 type hashRing struct {
 	vnodes []vnode
 }
@@ -19,6 +20,7 @@ func newHashRing(nodes []string, nvirtual int) *hashRing {
 	if nvirtual < 1 {
 		nvirtual = 100
 	}
+	// Map last-write-wins on hash collision, matching the Python dict.
 	seen := make(map[[16]byte]string, len(nodes)*nvirtual)
 	for _, node := range nodes {
 		for i := 0; i < nvirtual; i++ {
@@ -37,7 +39,7 @@ func newHashRing(nodes []string, nvirtual int) *hashRing {
 }
 
 func fmtNode(node string, i int) []byte {
-	// "{node}:{i}" — must match the Python SDK byte-for-byte.
+	// "{node}:{i}" — must match the Python SDK byte-for-byte (no extra zeros).
 	b := make([]byte, 0, len(node)+12)
 	b = append(b, node...)
 	b = append(b, ':')
@@ -60,6 +62,7 @@ func (r *hashRing) node(key string) string {
 	}
 	h := md5.Sum([]byte(key))
 	v := r.vnodes
+	// First hash >= key hash (bisect_left); wrap to 0 so the ring is circular.
 	idx := sort.Search(len(v), func(i int) bool {
 		return bytes.Compare(v[i].hash[:], h[:]) >= 0
 	})

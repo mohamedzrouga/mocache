@@ -6,6 +6,7 @@ metadata:
     app: mocache
 spec:
   clusterIP: None
+  publishNotReadyAddresses: false
   selector:
     app: mocache
   ports:
@@ -16,6 +17,16 @@ spec:
       port: 8091
       targetPort: grpc
 ---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: cache
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: mocache
+---
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -25,6 +36,7 @@ metadata:
 spec:
   serviceName: cache-headless
   replicas: 3
+  podManagementPolicy: OrderedReady
   selector:
     matchLabels:
       app: mocache
@@ -33,6 +45,7 @@ spec:
       labels:
         app: mocache
     spec:
+      terminationGracePeriodSeconds: 30
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
@@ -47,6 +60,8 @@ spec:
             - -http=:8090
             - -rpc=:8091
             - -capacity=100000
+            - -drain=5s
+            - -janitor=30s
           ports:
             - name: http
               containerPort: 8090
@@ -64,13 +79,19 @@ spec:
             limits:
               cpu: "1"
               memory: 512Mi
+          startupProbe:
+            httpGet:
+              path: /livez
+              port: http
+            periodSeconds: 2
+            failureThreshold: 30
           livenessProbe:
             httpGet:
-              path: /healthz
+              path: /livez
               port: http
             periodSeconds: 10
           readinessProbe:
             httpGet:
-              path: /healthz
+              path: /readyz
               port: http
-            periodSeconds: 5
+            periodSeconds: 2

@@ -53,6 +53,10 @@ class LiveServerTests(unittest.TestCase):
                 f"127.0.0.1:{cls.rpc_port}",
                 "-capacity",
                 "1000",
+                "-drain",
+                "0s",
+                "-janitor",
+                "0",
             ],
             cwd=REPO,
             stdout=subprocess.PIPE,
@@ -84,10 +88,13 @@ class LiveServerTests(unittest.TestCase):
 
     def test_http_round_trip(self) -> None:
         c = MoCacheClient([self.http_url], timeout=2.0, protocol="http")
-        c.set("user:123", "some_value", ttl_seconds=300)
-        self.assertEqual(c.get("user:123"), "some_value")
-        c.delete("user:123")
-        self.assertIsNone(c.get("user:123"))
+        try:
+            c.set("user:123", "some_value", ttl_seconds=300)
+            self.assertEqual(c.get("user:123"), "some_value")
+            c.delete("user:123")
+            self.assertIsNone(c.get("user:123"))
+        finally:
+            c.close()
 
     def test_grpc_round_trip(self) -> None:
         c = MoCacheClient([self.http_url], timeout=2.0, protocol="grpc", rpc_port=self.rpc_port)
@@ -101,12 +108,18 @@ class LiveServerTests(unittest.TestCase):
 
     def test_miss_is_none(self) -> None:
         c = MoCacheClient([self.http_url], timeout=2.0)
-        self.assertIsNone(c.get("absent"))
+        try:
+            self.assertIsNone(c.get("absent"))
+        finally:
+            c.close()
 
     def test_unavailable_is_error(self) -> None:
         c = MoCacheClient(["http://127.0.0.1:1"], timeout=0.2)
-        with self.assertRaises(MoCacheError):
-            c.get("x")
+        try:
+            with self.assertRaises(MoCacheError):
+                c.get("x")
+        finally:
+            c.close()
 
 
 def _free_port() -> int:

@@ -1,0 +1,17 @@
+MoCache {{ .Chart.Version }} installed as {{ include "mocache.fullname" . }}.
+
+StatefulSet pods (stable DNS, use these in both SDKs):
+{{- $full := include "mocache.fullname" . }}
+{{- $ns := .Release.Namespace }}
+{{- $http := .Values.ports.http }}
+{{- range $i, $_ := until (.Values.replicaCount | int) }}
+  http://{{ $full }}-{{ $i }}.{{ $full }}-headless.{{ $ns }}.svc.cluster.local:{{ $http }}
+{{- end }}
+
+A rolling upgrade (helm upgrade) replaces one pod at a time (OrderedReady).
+That pod's shard is empty until clients refill it. The other N-1 pods keep
+serving. Clients must treat network errors as misses — there is no failover
+to a different node.
+
+Liveness is /livez (stays 200 during drain). Readiness is /readyz (goes 503
+on SIGTERM so Endpoints drop the pod before sockets close).

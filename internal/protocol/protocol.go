@@ -1,6 +1,8 @@
 // Package protocol implements MoCache's unary RPC framing (the fast "gRPC" path).
-// It is a length-prefixed binary protocol over TCP, not google.golang.org/grpc —
-// that library would violate the zero-third-party-dependency constraint.
+//
+// Wire format: uint32be length (of the payload only) + payload. Payload starts
+// with magic "MOC1" and version 1. This is not google.golang.org/grpc — that
+// library would violate the zero-third-party-dependency constraint.
 package protocol
 
 import (
@@ -12,7 +14,7 @@ import (
 const (
 	Magic    = "MOC1"
 	Version  = byte(1)
-	MaxFrame = 4 << 20
+	MaxFrame = 4 << 20 // reject oversized frames so a client cannot OOM us
 
 	OpGet    = byte(1)
 	OpSet    = byte(2)

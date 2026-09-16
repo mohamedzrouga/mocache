@@ -1,4 +1,12 @@
-"""MoCache Python SDK — consistent-hash client with HTTP and unary RPC transports."""
+"""MoCache Python SDK — consistent-hash client with HTTP and unary RPC transports.
+
+Go import counterpart: github.com/med/mocache/sdk/go
+
+A cache miss is None. Network/timeout failures raise MoCacheError. Call close()
+(or use the context manager) so RPC sockets are not leaked across process
+lifetime. Node restarts empty the shard; the client retries a broken TCP
+session once so a rolling restart is a miss, not a crash.
+"""
 
 from __future__ import annotations
 
@@ -29,7 +37,11 @@ class MoCacheError(Exception):
 
 
 class HashRing:
-    """MD5 consistent hash with virtual nodes; identical to the Go SDK."""
+    """MD5 consistent hash with virtual nodes; identical to the Go SDK.
+
+    Lookup is the first ring position at or after the key hash (bisect_left),
+    wrapping to index 0 so the ring is circular.
+    """
 
     def __init__(self, nodes: list[str], vnodes: int = 100) -> None:
         if vnodes < 1:
@@ -69,12 +81,15 @@ class MoCacheClient:
         self._timeout = timeout
         self._protocol = protocol
         self._rpc_port = rpc_port
+        self._closed = False
+        self._close_lock = threading.Lock()
         self._rpc: dict[str, _RPCConn] = {}
         if protocol == "grpc":
             for node in nodes:
                 self._rpc[node] = _RPCConn(_rpc_addr(node, rpc_port), timeout)
 
     def get(self, key: str) -> str | None:
+        self._check_open()
         node = self._ring.node(key)
         if self._protocol == "grpc":
             status, value = self._rpc[node].call(_OP_GET, key)
@@ -89,6 +104,7 @@ class MoCacheClient:
         return body.decode("utf-8")
 
     def set(self, key: str, value: str, ttl_seconds: int = 300) -> None:
+        self._check_open()
         node = self._ring.node(key)
         if self._protocol == "grpc":
             ttl = ttl_seconds if ttl_seconds > 0 else 0
@@ -100,6 +116,7 @@ class MoCacheClient:
             raise MoCacheError(f"SET {key!r} via {node}: http {code}")
 
     def delete(self, key: str) -> None:
+        self._check_open()
         node = self._ring.node(key)
         if self._protocol == "grpc":
             self._rpc[node].call(_OP_DELETE, key)
@@ -109,10 +126,31 @@ class MoCacheClient:
             raise MoCacheError(f"DELETE {key!r} via {node}: http {code}")
 
     def close(self) -> None:
-        for conn in self._rpc.values():
-            conn.close()
+        with self._close_lock:
+            self._closed = True
+            for conn in self._rpc.values():
+                conn.close()
+
+    def __enter__(self) -> MoCacheClient:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    def _check_open(self) -> None:
+        if self._closed:
+            raise MoCacheError("client closed")
 
     def _http(self, method: str, url: str, data: bytes | None = None, content_type: str = "") -> tuple[int, bytes]:
+        try:
+            return self._http_once(method, url, data, content_type)
+        except MoCacheError as e:
+            # Rolling restart often RSTs a keep-alive socket; retry once, not on timeout.
+            if e.timeout:
+                raise
+            return self._http_once(method, url, data, content_type)
+
+    def _http_once(self, method: str, url: str, data: bytes | None, content_type: str) -> tuple[int, bytes]:
         headers = {"Content-Type": content_type} if content_type else {}
         req = Request(url, data=data, method=method, headers=headers)
         try:
@@ -141,6 +179,9 @@ def _rpc_addr(node: str, port: int) -> str:
 
 
 class _RPCConn:
+    """One persistent TCP session per cache node. The lock serializes frames
+    (the protocol is not multiplexed) and reconnect after a peer restart."""
+
     def __init__(self, addr: str, timeout: float) -> None:
         self._addr = addr
         self._timeout = timeout
@@ -150,22 +191,31 @@ class _RPCConn:
 
     def call(self, op: int, key: str, value: bytes = b"", ttl: int = 0) -> tuple[int, bytes]:
         with self._lock:
-            self._next_id = (self._next_id + 1) & 0xFFFFFFFF
-            req_id = self._next_id
             try:
-                sock = self._ensure()
-                sock.sendall(_encode_request(op, req_id, key, value, ttl))
-                status, rid, body, err = _read_response(sock)
-            except (TimeoutError, socket.timeout, OSError) as e:
+                return self._call_locked(op, key, value, ttl)
+            except MoCacheError as e:
+                if e.timeout:
+                    raise
                 self._reset()
-                timeout = isinstance(e, (TimeoutError, socket.timeout))
-                raise MoCacheError(f"rpc {self._addr} {key!r}: {e}", timeout=timeout) from e
-            if rid != req_id:
-                self._reset()
-                raise MoCacheError(f"rpc {self._addr}: response id mismatch")
-            if status == _STATUS_ERROR:
-                raise MoCacheError(err or "rpc error")
-            return status, body
+                return self._call_locked(op, key, value, ttl)
+
+    def _call_locked(self, op: int, key: str, value: bytes, ttl: int) -> tuple[int, bytes]:
+        self._next_id = (self._next_id + 1) & 0xFFFFFFFF
+        req_id = self._next_id
+        try:
+            sock = self._ensure()
+            sock.sendall(_encode_request(op, req_id, key, value, ttl))
+            status, rid, body, err = _read_response(sock)
+        except (TimeoutError, socket.timeout, OSError) as e:
+            self._reset()
+            timeout = isinstance(e, (TimeoutError, socket.timeout))
+            raise MoCacheError(f"rpc {self._addr} {key!r}: {e}", timeout=timeout) from e
+        if rid != req_id:
+            self._reset()
+            raise MoCacheError(f"rpc {self._addr}: response id mismatch")
+        if status == _STATUS_ERROR:
+            raise MoCacheError(err or "rpc error")
+        return status, body
 
     def close(self) -> None:
         self._reset()

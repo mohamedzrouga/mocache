@@ -1,0 +1,93 @@
+# Example values for a 3-node in-cluster MoCache deployment.
+# Client SDKs must use the same replica count and DNS names:
+#   http://{{ name }}-0.{{ name }}-headless.{{ namespace }}.svc.cluster.local:8090
+#   http://{{ name }}-1.{{ name }}-headless.{{ namespace }}.svc.cluster.local:8090
+#   http://{{ name }}-2.{{ name }}-headless.{{ namespace }}.svc.cluster.local:8090
+
+nameOverride: cache
+fullnameOverride: ""
+
+replicaCount: 3
+
+image:
+  repository: mocache
+  tag: "0.1.0"
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# Item-count cap per pod. Size memory limits ~ cap × avg value × 1.3.
+capacity: 100000
+
+# In-process drain after SIGTERM: fail /readyz, wait, then close sockets.
+# Must be shorter than terminationGracePeriodSeconds.
+drain: 5s
+janitor: 30s
+
+ports:
+  http: 8090
+  rpc: 8091
+
+service:
+  annotations: {}
+
+podAnnotations: {}
+
+updateStrategy:
+  type: RollingUpdate
+  rollingUpdate:
+    partition: 0
+
+podManagementPolicy: OrderedReady
+
+terminationGracePeriodSeconds: 30
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 2
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    cpu: "1"
+    memory: 512Mi
+
+probes:
+  liveness:
+    path: /livez
+    port: http
+    periodSeconds: 10
+    timeoutSeconds: 1
+    failureThreshold: 3
+  readiness:
+    path: /readyz
+    port: http
+    periodSeconds: 2
+    timeoutSeconds: 1
+    failureThreshold: 2
+  startup:
+    path: /livez
+    port: http
+    periodSeconds: 2
+    timeoutSeconds: 1
+    failureThreshold: 30
+
+securityContext:
+  pod:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    fsGroup: 65532
+    seccompProfile:
+      type: RuntimeDefault
+  container:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop: ["ALL"]
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
