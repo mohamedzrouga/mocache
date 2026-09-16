@@ -44,7 +44,7 @@ On SIGTERM the process fails `/readyz`, waits `-drain` (default 5s), then closes
 ```go
 import (
     "context"
-    mocache "github.com/med/mocache/sdk/go"
+    mocache "github.com/mohamedzrouga/mocache/sdk/go"
 )
 
 c := mocache.New(nodes, mocache.WithTimeout(time.Second))

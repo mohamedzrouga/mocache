@@ -1,6 +1,6 @@
 # SDK layout
 
-- `sdk/go` — Go client, sync + context + channel-async (`import "github.com/med/mocache/sdk/go"`)
+- `sdk/go` — Go client, sync + context + channel-async (`import "github.com/mohamedzrouga/mocache/sdk/go"`)
 - `sdk/python` — `MoCacheClient` (sync) and `AsyncMoCacheClient` (asyncio)
 - `sdk/examples/go` — sync, context, GetAsync, invalidate
 - `sdk/examples/python/sync.py`

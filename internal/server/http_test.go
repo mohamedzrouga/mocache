@@ -6,7 +6,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/med/mocache/internal/cache"
+	"github.com/mohamedzrouga/mocache/internal/cache"
 )
 
 func TestReadyzTracksGate(t *testing.T) {

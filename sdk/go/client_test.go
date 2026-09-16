@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/med/mocache/internal/cache"
-	"github.com/med/mocache/internal/server"
+	"github.com/mohamedzrouga/mocache/internal/cache"
+	"github.com/mohamedzrouga/mocache/internal/server"
 )
 
 func startHTTP(t *testing.T, c *cache.Cache) *httptest.Server {

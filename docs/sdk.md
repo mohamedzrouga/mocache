@@ -11,7 +11,7 @@ Both clients:
 - `InvalidatePrefix` / `InvalidateRegex` **broadcast to every node**
 - Close idle sockets
 
-## Go (`github.com/med/mocache/sdk/go`)
+## Go (`github.com/mohamedzrouga/mocache/sdk/go`)
 
 | Style | Methods |
 |---|---|

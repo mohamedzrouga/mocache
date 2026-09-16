@@ -9,8 +9,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/med/mocache/internal/cache"
-	"github.com/med/mocache/internal/obs"
+	"github.com/mohamedzrouga/mocache/internal/cache"
+	"github.com/mohamedzrouga/mocache/internal/obs"
 )
 
 const maxBody = 1 << 20 // keep JSON /set well under the per-value cap

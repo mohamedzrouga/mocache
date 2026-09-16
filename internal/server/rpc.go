@@ -8,8 +8,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/med/mocache/internal/cache"
-	"github.com/med/mocache/internal/protocol"
+	"github.com/mohamedzrouga/mocache/internal/cache"
+	"github.com/mohamedzrouga/mocache/internal/protocol"
 )
 
 const defaultMaxConns = 8192

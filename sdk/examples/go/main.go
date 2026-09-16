@@ -7,7 +7,7 @@ import (
 	"os"
 	"time"
 
-	mocache "github.com/med/mocache/sdk/go"
+	mocache "github.com/mohamedzrouga/mocache/sdk/go"
 )
 
 func main() {

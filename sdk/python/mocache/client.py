@@ -1,6 +1,6 @@
 """MoCache Python SDK — consistent-hash client with HTTP and unary RPC transports.
 
-Go import counterpart: github.com/med/mocache/sdk/go
+Go import counterpart: github.com/mohamedzrouga/mocache/sdk/go
 
 A cache miss is None. Network/timeout failures raise MoCacheError. Call close()
 (or use the context manager) so RPC sockets are not leaked across process

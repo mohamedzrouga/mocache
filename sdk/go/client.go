@@ -1,6 +1,6 @@
 // Package mocache is the Go client SDK for MoCache.
 //
-// Import path: github.com/med/mocache/sdk/go
+// Import path: github.com/mohamedzrouga/mocache/sdk/go
 //
 // Sync methods (Get/Set/Delete) block until the node answers or the client
 // timeout fires. Context methods (*Context) are the cancellable variants.

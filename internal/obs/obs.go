@@ -20,7 +20,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/med/mocache/internal/cache"
+	"github.com/mohamedzrouga/mocache/internal/cache"
 )
 
 var (

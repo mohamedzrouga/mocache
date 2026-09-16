@@ -11,7 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/med/mocache/internal/protocol"
+	"github.com/mohamedzrouga/mocache/internal/protocol"
 )
 
 type rpcTransport struct {
