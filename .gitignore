@@ -1,0 +1,8 @@
+/mocache
+/bin/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+dist/
+.DS_Store
