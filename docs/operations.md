@@ -61,6 +61,10 @@ The LRU cannot grow past `-capacity` items. Size `resources.limits.memory` with 
 ## Local run
 
 ```bash
-go run ./cmd/mocache -http :8090 -rpc :8091 -capacity 100000
+make run
+# or
+go run ./cmd/mocache -http :8090 -rpc :8091
 curl -s localhost:8090/livez
 ```
+
+Container images: `make docker-build` or `make podman-build` (see [build.md](build.md)).

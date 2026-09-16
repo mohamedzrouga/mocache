@@ -8,4 +8,5 @@
 | [sdk.md](sdk.md) | Go and Python clients |
 | [operations.md](operations.md) | Rollouts, restarts, crashes, probes |
 | [observability.md](observability.md) | JSON logs, Prometheus, OTEL, memory caps |
+| [build.md](build.md) | Make, Docker, Podman |
 | [helm.md](helm.md) | Example chart (`helm/example`) |

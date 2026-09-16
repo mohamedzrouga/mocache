@@ -1,0 +1,14 @@
+.git
+.gitignore
+bin/
+.venv/
+**/__pycache__/
+**/*.exe
+**/*.pyc
+helm/
+docs/
+deploy/
+sdk/examples/
+sdk/python/
+*.md
+Makefile

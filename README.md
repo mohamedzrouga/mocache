@@ -34,6 +34,12 @@ docs                 operational and API docs
 Requires Go 1.25+.
 
 ```bash
+make build && make run
+make docker-build    # or: make podman-build
+make image           # podman if installed, else docker
+```
+
+```bash
 go run ./cmd/mocache -http :8090 -rpc :8091 -capacity 100000 -max-bytes 67108864 -mem-limit 134217728
 ```
 
