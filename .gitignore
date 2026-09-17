@@ -6,3 +6,5 @@ __pycache__/
 .venv/
 dist/
 .DS_Store
+lab/results/*
+!lab/results/.gitkeep

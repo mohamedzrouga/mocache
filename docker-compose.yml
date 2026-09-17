@@ -1,0 +1,45 @@
+# Three MoCache nodes on one machine — the local counterpart of the 3-replica
+# StatefulSet in helm/example. Nodes never talk to each other; the SDK ring
+# decides which node owns a key, so the client node list must match exactly:
+#
+#   http://127.0.0.1:8090,http://127.0.0.1:8092,http://127.0.0.1:8094
+#
+# For the MinIO + FastAPI + benchmark scenario use lab/docker-compose.yml.
+name: mocache
+
+x-cache-node: &cache-node
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: mocache:0.1.0
+  command:
+    - -http=:8090
+    - -rpc=:8091
+    - -capacity=100000
+    - -max-bytes=67108864   # 64Mi of keys+values+overhead
+    - -mem-limit=201326592  # 192Mi Go soft limit, below the 256M container cap
+    - -drain=5s
+    - -janitor=30s
+    - -access-log=false
+  restart: unless-stopped
+  stop_grace_period: 30s    # must exceed -drain
+  mem_limit: 256m
+  read_only: true
+  security_opt: [no-new-privileges:true]
+  cap_drop: [ALL]
+
+services:
+  cache1:
+    <<: *cache-node
+    container_name: mocache-cache1
+    ports: ["8090:8090", "8091:8091"]
+
+  cache2:
+    <<: *cache-node
+    container_name: mocache-cache2
+    ports: ["8092:8090", "8093:8091"]
+
+  cache3:
+    <<: *cache-node
+    container_name: mocache-cache3
+    ports: ["8094:8090", "8095:8091"]

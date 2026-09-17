@@ -1,0 +1,17 @@
+# BuildKit prefers <dockerfile>.dockerignore over the context-root .dockerignore.
+# The root one excludes sdk/python/ (the Go image does not need it); this image
+# does, so the lab API build gets its own list.
+.git
+.gitignore
+bin/
+.venv/
+**/__pycache__/
+**/*.pyc
+**/*.exe
+helm/
+docs/
+deploy/
+lab/results/
+sdk/go/
+sdk/examples/
+sdk/python/tests/

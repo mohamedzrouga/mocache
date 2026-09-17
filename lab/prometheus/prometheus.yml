@@ -1,0 +1,11 @@
+# Scrapes the three cache nodes' /metrics (hand-written Prometheus exposition,
+# see internal/obs). Optional: docker compose --profile obs up -d prometheus
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: mocache
+    static_configs:
+      - targets: ["cache1:8090", "cache2:8090", "cache3:8090"]
+        labels: { stack: lab }

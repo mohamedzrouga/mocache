@@ -10,3 +10,4 @@
 | [observability.md](observability.md) | JSON logs, Prometheus, OTEL, memory caps |
 | [build.md](build.md) | Make, Docker, Podman |
 | [helm.md](helm.md) | Example chart (`helm/example`) |
+| [../lab/README.md](../lab/README.md) | Local MinIO + FastAPI + benchmark lab |
