@@ -20,3 +20,8 @@ spec:
     - name: grpc
       port: {{ .Values.ports.rpc }}
       targetPort: grpc
+    {{- if .Values.resp.enabled }}
+    - name: resp
+      port: {{ .Values.ports.resp }}
+      targetPort: resp
+    {{- end }}

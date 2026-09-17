@@ -1,9 +1,14 @@
 # Three MoCache nodes on one machine — the local counterpart of the 3-replica
-# StatefulSet in helm/example. Nodes never talk to each other; the SDK ring
-# decides which node owns a key, so the client node list must match exactly:
+# StatefulSet in helm/example. Nodes never talk to each other; routing is the
+# client's job, and there are two schemes (docs/cluster.md):
 #
-#   http://127.0.0.1:8090,http://127.0.0.1:8092,http://127.0.0.1:8094
+#   MoCache SDK, MD5 ring over HTTP/RPC:
+#     http://127.0.0.1:8090,http://127.0.0.1:8092,http://127.0.0.1:8094
 #
+#   Redis clients, CRC16 slots over RESP (cluster mode, announced on 6379-6381):
+#     redis-cli -c -p 6379   /   RedisCluster(host="127.0.0.1", port=6379)
+#
+# The announce addresses are 127.0.0.1 so MOVED redirects work from the host.
 # For the MinIO + FastAPI + benchmark scenario use lab/docker-compose.yml.
 name: mocache
 
@@ -12,15 +17,7 @@ x-cache-node: &cache-node
     context: .
     dockerfile: Dockerfile
   image: mocache:0.1.0
-  command:
-    - -http=:8090
-    - -rpc=:8091
-    - -capacity=100000
-    - -max-bytes=67108864   # 64Mi of keys+values+overhead
-    - -mem-limit=201326592  # 192Mi Go soft limit, below the 256M container cap
-    - -drain=5s
-    - -janitor=30s
-    - -access-log=false
+  command: []  # per-node below: each owns a different slot range
   restart: unless-stopped
   stop_grace_period: 30s    # must exceed -drain
   mem_limit: 256m
@@ -32,14 +29,50 @@ services:
   cache1:
     <<: *cache-node
     container_name: mocache-cache1
-    ports: ["8090:8090", "8091:8091"]
+    command:
+      - -http=:8090
+      - -rpc=:8091
+      - -resp=:6379
+      - -cluster-announce=127.0.0.1:6379
+      - -cluster-peer=127.0.0.1:6379=0-5460,127.0.0.1:6380=5461-10922,127.0.0.1:6381=10923-16383
+      - -capacity=100000
+      - -max-bytes=67108864   # 64Mi of keys+values+overhead
+      - -mem-limit=201326592  # 192Mi Go soft limit, below the 256M container cap
+      - -drain=5s
+      - -janitor=30s
+      - -access-log=false
+    ports: ["8090:8090", "8091:8091", "6379:6379"]
 
   cache2:
     <<: *cache-node
     container_name: mocache-cache2
-    ports: ["8092:8090", "8093:8091"]
+    command:
+      - -http=:8090
+      - -rpc=:8091
+      - -resp=:6379
+      - -cluster-announce=127.0.0.1:6380
+      - -cluster-peer=127.0.0.1:6379=0-5460,127.0.0.1:6380=5461-10922,127.0.0.1:6381=10923-16383
+      - -capacity=100000
+      - -max-bytes=67108864   # 64Mi of keys+values+overhead
+      - -mem-limit=201326592  # 192Mi Go soft limit, below the 256M container cap
+      - -drain=5s
+      - -janitor=30s
+      - -access-log=false
+    ports: ["8092:8090", "8093:8091", "6380:6379"]
 
   cache3:
     <<: *cache-node
     container_name: mocache-cache3
-    ports: ["8094:8090", "8095:8091"]
+    command:
+      - -http=:8090
+      - -rpc=:8091
+      - -resp=:6379
+      - -cluster-announce=127.0.0.1:6381
+      - -cluster-peer=127.0.0.1:6379=0-5460,127.0.0.1:6380=5461-10922,127.0.0.1:6381=10923-16383
+      - -capacity=100000
+      - -max-bytes=67108864   # 64Mi of keys+values+overhead
+      - -mem-limit=201326592  # 192Mi Go soft limit, below the 256M container cap
+      - -drain=5s
+      - -janitor=30s
+      - -access-log=false
+    ports: ["8094:8090", "8095:8091", "6381:6379"]

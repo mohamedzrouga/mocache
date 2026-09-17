@@ -1,9 +1,17 @@
 # MoCache lab: MinIO (S3) <- FastAPI cache-aside API -> 3 MoCache nodes, plus a
-# load generator. Run from this directory (see lab/README.md):
+# load generator and the Redis-client compatibility checks.
+# Run from this directory (see lab/README.md):
 #
 #   docker compose up -d --build        # minio + 3 cache nodes + api
 #   docker compose run --rm seed        # upload random objects to MinIO
 #   docker compose run --rm bench --compare
+#   docker compose run --rm compat-py --cluster    # real redis-py against the cluster
+#   docker compose run --rm compat-go -cluster     # real go-redis against the cluster
+#
+# The three nodes serve all four front ends at once: HTTP :8090, unary RPC
+# :8091, and RESP :6379 with slots 0-5460 / 5461-10922 / 10923-16383. Slot
+# routing and MOVED apply only to the RESP port — the FastAPI app keeps using
+# the SDK's own MD5 ring over HTTP, and the two coexist on one LRU.
 #
 # Host ports are offset (18090+) so this stack can run next to the root
 # docker-compose.yml without colliding.
@@ -16,15 +24,7 @@ x-cache-node: &cache-node
   image: mocache:0.1.0
   # Deliberately small: 20k items / 32Mi forces evictions once the working set
   # grows, so the benchmark shows a realistic hit ratio instead of a warm 100%.
-  command:
-    - -http=:8090
-    - -rpc=:8091
-    - -capacity=20000
-    - -max-bytes=33554432
-    - -max-value=1048576
-    - -mem-limit=100663296
-    - -drain=5s
-    - -janitor=30s
+  command: []   # per-node; see each service below
   restart: unless-stopped
   stop_grace_period: 30s
   mem_limit: 192m
@@ -59,15 +59,51 @@ services:
   cache1:
     <<: *cache-node
     container_name: lab-cache1
-    ports: ["18090:8090"]
+    command:
+      - -http=:8090
+      - -rpc=:8091
+      - -resp=:6379
+      - -cluster-announce=cache1:6379
+      - -cluster-peer=cache1:6379=0-5460,cache2:6379=5461-10922,cache3:6379=10923-16383
+      - -capacity=20000
+      - -max-bytes=33554432
+      - -max-value=1048576
+      - -mem-limit=100663296
+      - -drain=5s
+      - -janitor=30s
+    ports: ["18090:8090", "16379:6379"]
   cache2:
     <<: *cache-node
     container_name: lab-cache2
-    ports: ["18092:8090"]
+    command:
+      - -http=:8090
+      - -rpc=:8091
+      - -resp=:6379
+      - -cluster-announce=cache2:6379
+      - -cluster-peer=cache1:6379=0-5460,cache2:6379=5461-10922,cache3:6379=10923-16383
+      - -capacity=20000
+      - -max-bytes=33554432
+      - -max-value=1048576
+      - -mem-limit=100663296
+      - -drain=5s
+      - -janitor=30s
+    ports: ["18092:8090", "16380:6379"]
   cache3:
     <<: *cache-node
     container_name: lab-cache3
-    ports: ["18094:8090"]
+    command:
+      - -http=:8090
+      - -rpc=:8091
+      - -resp=:6379
+      - -cluster-announce=cache3:6379
+      - -cluster-peer=cache1:6379=0-5460,cache2:6379=5461-10922,cache3:6379=10923-16383
+      - -capacity=20000
+      - -max-bytes=33554432
+      - -max-value=1048576
+      - -mem-limit=100663296
+      - -drain=5s
+      - -janitor=30s
+    ports: ["18094:8090", "16381:6379"]
 
   # One-shot: create the bucket and upload OBJECT_COUNT random objects.
   seed:
@@ -132,6 +168,34 @@ services:
     user: "${LAB_UID:-1000}:${LAB_GID:-1000}"
     volumes:
       - ./results:/results
+    networks: [lab]
+
+  # Real Redis clients, unmodified, against the RESP port. Add --cluster /
+  # -cluster to exercise slot discovery and MOVED across all three nodes.
+  compat-py:
+    build:
+      context: ./compat
+      dockerfile: py/Dockerfile
+    image: mocache-compat-py:0.1.0
+    container_name: lab-compat-py
+    profiles: [tools]
+    depends_on: [cache1, cache2, cache3]
+    environment:
+      REDIS_HOST: cache1
+      REDIS_PORT: "6379"
+    networks: [lab]
+
+  compat-go:
+    build:
+      context: ./compat
+      dockerfile: go/Dockerfile
+    image: mocache-compat-go:0.1.0
+    container_name: lab-compat-go
+    profiles: [tools]
+    depends_on: [cache1, cache2, cache3]
+    environment:
+      REDIS_ADDR: cache1:6379
+      REDIS_ADDRS: cache1:6379,cache2:6379,cache3:6379
     networks: [lab]
 
   # Optional: docker compose --profile obs up -d prometheus  -> http://127.0.0.1:9090

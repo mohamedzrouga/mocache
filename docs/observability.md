@@ -28,8 +28,19 @@ Scrape `GET /metrics` (`text/plain; version=0.0.4`).
 | `mocache_http_errors_total` | counter |
 | `mocache_in_flight` | gauge |
 | `mocache_request_duration_seconds` | histogram |
+| `mocache_resp_commands_total` | counter |
+| `mocache_resp_errors_total` | counter |
+| `mocache_resp_moved_total` | counter |
+| `mocache_resp_connections` | gauge |
+| `mocache_resp_duration_seconds_sum` | counter |
+| `mocache_cluster_enabled` | gauge |
+| `mocache_cluster_slots_assigned` | gauge |
+| `mocache_cluster_known_nodes` | gauge |
+| `mocache_cluster_my_slots` | gauge |
 | `go_goroutines` | gauge |
 | `go_memstats_alloc_bytes` / `_sys_bytes` / `_heap_inuse_bytes` | gauge |
+
+`mocache_resp_moved_total` is the cluster health signal to alert on: a sustained redirect rate means clients are routing on a stale slot map. `mocache_cluster_slots_assigned` below 16384 means part of the keyspace has no owner.
 
 Point Prometheus at the **pod IP** (or a metrics Service), not only the headless cache DNS — headless is for client hashing.
 

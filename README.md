@@ -1,6 +1,6 @@
 # MoCache
 
-In-house distributed cache: dumb Go nodes, smart clients. No Redis, no Valkey, no third-party runtime libraries.
+In-house distributed cache: dumb Go nodes, smart clients. No Redis, no Valkey, no third-party runtime libraries — but it **speaks the Redis protocol**, so stock Redis clients can use it unmodified.
 
 Cache nodes are independent LRU processes. Go and Python SDKs hash keys onto the same MD5 virtual-node ring and talk to exactly one node per call. There is no replication, persistence, or cluster membership — a node restart loses its shard, which is accepted for a recomputable cache.
 
@@ -26,10 +26,13 @@ docs                 operational and API docs
 
 ## Transports
 
-| Protocol | Port | Client option | Notes |
+| Protocol | Port | Client | Notes |
 |---|---|---|---|
-| HTTP | 8090 | `http` (default) | `/get` `/set` `/delete` `/invalidate` `/livez` `/readyz` `/healthz` `/metrics` |
-| Unary RPC (`grpc`) | 8091 | `grpc` | Persistent TCP, length-prefixed frames. Not `google.golang.org/grpc`. |
+| HTTP | 8090 | MoCache SDK (default) | `/get` `/set` `/delete` `/invalidate` `/livez` `/readyz` `/healthz` `/metrics` |
+| Unary RPC (`grpc`) | 8091 | MoCache SDK | Persistent TCP, length-prefixed frames. Not `google.golang.org/grpc`. |
+| RESP | 6379 | **any Redis client** | RESP2/RESP3, 56 commands, Redis Cluster slots. Off unless `-resp` is set. |
+
+The MoCache SDKs route with an MD5 ring; Redis clients route with CRC16 slots. Both reach the same LRU, and they place keys differently — use one scheme per keyspace ([docs/cluster.md](docs/cluster.md)).
 
 ## Server
 
@@ -54,7 +57,32 @@ make compose-down
 
 On SIGTERM the process fails `/readyz`, waits `-drain` (default 5s), then closes listeners and tracked RPC sockets. `/livez` stays 200 during drain so Kubernetes does not SIGKILL a shutting-down pod.
 
-## Clients
+## Redis clients
+
+```bash
+go run ./cmd/mocache -resp :6379
+```
+
+```python
+import redis
+r = redis.Redis(host="127.0.0.1", port=6379)   # redis-py, unmodified
+r.set("user:1", "alice", ex=300)
+```
+
+Sharded across three nodes, every node takes the same peer list:
+
+```bash
+mocache -resp :6379 -cluster-announce 10.0.0.1:6379 \
+  -cluster-peer 10.0.0.1:6379=0-5460 \
+  -cluster-peer 10.0.0.2:6379=5461-10922 \
+  -cluster-peer 10.0.0.3:6379=10923-16383
+```
+
+`RedisCluster` and `ClusterClient` then discover the shards from `CLUSTER SLOTS` and follow `MOVED` — no MoCache-specific code. Strings and TTLs only; no lists, hashes, pub/sub, or scripting. **No replication or failover yet**: a node that is down takes its slots with it. See [docs/redis.md](docs/redis.md) and [docs/cluster.md](docs/cluster.md).
+
+Verify with the real clients: `make lab-up && make compat`.
+
+## MoCache SDK clients
 
 ```go
 import (
@@ -110,4 +138,5 @@ See [docs/helm.md](docs/helm.md), [docs/operations.md](docs/operations.md), and 
 ```bash
 go test ./...
 PYTHONPATH=sdk/python python3.13 -m unittest discover -s sdk/python/tests -v
+make compat     # real redis-py and go-redis against a running lab cluster
 ```

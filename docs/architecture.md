@@ -30,6 +30,18 @@ A single Go binary:
 - HTTP on `-http` (default `:8090`) and unary RPC on `-rpc` (default `:8091`).
 - Process-local only. No disk. A crash or rolling restart starts empty.
 
+## Front ends
+
+One LRU, three listeners:
+
+| Port | Protocol | Routing |
+|---|---|---|
+| 8090 | HTTP | MoCache SDK, MD5 virtual-node ring |
+| 8091 | Unary RPC | MoCache SDK, same ring |
+| 6379 | RESP (Redis) | The Redis client, CRC16 slots |
+
+The Redis port is off unless `-resp` is set. The two routing schemes place keys differently and neither redirects the other's traffic, so a keyspace should be reached through one of them, not both — see [cluster.md](cluster.md).
+
 ## Client routing
 
 Both SDKs build the same MD5 virtual-node ring at construction (`vnodes=100` by default). Node lists are static. Adding or removing a node requires updating every client's config; ~1/N of keys move.

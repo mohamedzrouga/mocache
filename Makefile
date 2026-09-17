@@ -36,7 +36,8 @@ BENCH_ARGS ?= --compare
 .PHONY: help build build-linux test test-python clean \
 	image docker-build podman-build docker-run podman-run run \
 	compose-up compose-down \
-	lab-up lab-seed lab-bench lab-sweep lab-stats lab-logs lab-down lab-clean
+	lab-up lab-seed lab-bench lab-sweep lab-stats lab-logs lab-down lab-clean \
+	compat compat-py compat-go redis-cli
 
 help:
 	@echo "MoCache"
@@ -61,6 +62,12 @@ help:
 	@echo "  make lab-stats      API counters + per-node /metrics"
 	@echo "  make lab-logs       follow lab logs"
 	@echo "  make lab-down       stop the lab (lab-clean also drops the MinIO volume)"
+	@echo ""
+	@echo "Redis compatibility (needs the lab nodes up: make lab-up)"
+	@echo "  make compat         redis-py and go-redis, standalone and cluster"
+	@echo "  make compat-py      redis-py only (COMPAT_ARGS=--cluster)"
+	@echo "  make compat-go      go-redis only (COMPAT_ARGS=-cluster)"
+	@echo "  make redis-cli      interactive redis-cli against the lab cluster"
 
 $(BIN_DIR):
 	mkdir -p $(BIN_DIR)
@@ -136,3 +143,25 @@ lab-down:
 # Also removes the MinIO volume: the next lab-seed re-uploads from scratch.
 lab-clean:
 	$(COMPOSE) -f $(LAB)/docker-compose.yml down -v
+
+# --- Redis-protocol compatibility ------------------------------------------
+# Real redis-py and go-redis clients against the lab's RESP port. Nothing
+# MoCache-specific sits between the client and the wire; see docs/redis.md.
+
+COMPAT_ARGS ?=
+
+compat:
+	$(COMPOSE) -f $(LAB)/docker-compose.yml run --rm compat-py
+	$(COMPOSE) -f $(LAB)/docker-compose.yml run --rm compat-py --cluster
+	$(COMPOSE) -f $(LAB)/docker-compose.yml run --rm compat-go
+	$(COMPOSE) -f $(LAB)/docker-compose.yml run --rm compat-go -cluster
+
+compat-py:
+	$(COMPOSE) -f $(LAB)/docker-compose.yml run --rm compat-py $(COMPAT_ARGS)
+
+compat-go:
+	$(COMPOSE) -f $(LAB)/docker-compose.yml run --rm compat-go $(COMPAT_ARGS)
+
+# -c follows MOVED redirects across the three shards.
+redis-cli:
+	docker run --rm -it --network mocache-lab redis:7-alpine redis-cli -c -h cache1 -p 6379

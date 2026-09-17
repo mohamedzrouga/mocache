@@ -1,6 +1,6 @@
 # MoCache lab
 
-A throwaway stack that answers one question: **what does putting MoCache in front of object storage actually buy?**
+A throwaway stack with two jobs: **what does putting MoCache in front of object storage actually buy?**, and **do real Redis clients work against it?**
 
 ```
 bench.py  ──HTTP──▶  FastAPI (cache-aside)  ──miss──▶  MinIO (S3)
@@ -19,6 +19,15 @@ docker compose run --rm seed          # upload 2000 random objects (~67 MiB)
 docker compose run --rm bench --compare
 ```
 
+Redis-client compatibility, against the same three nodes:
+
+```bash
+docker compose run --rm compat-py             # redis-py, standalone
+docker compose run --rm compat-py --cluster   # redis-py RedisCluster
+docker compose run --rm compat-go             # go-redis, RESP3
+docker compose run --rm compat-go -cluster    # go-redis ClusterClient
+```
+
 Teardown: `docker compose down -v` (`-v` also drops the MinIO volume).
 
 From the repo root the same flow is `make lab-up`, `make lab-seed`, `make lab-bench`, `make lab-down`.
@@ -29,6 +38,7 @@ From the repo root the same flow is `make lab-up`, `make lab-seed`, `make lab-be
 | MinIO console | http://127.0.0.1:9001 | `minioadmin` / `minioadmin` |
 | MinIO S3 | http://127.0.0.1:9000 | bucket `lab` |
 | cache1/2/3 metrics | :18090 / :18092 / :18094 | `curl -s 127.0.0.1:18090/metrics` |
+| cache1/2/3 RESP | :16379 / :16380 / :16381 | `redis-cli -p 16379` (see the note below) |
 | Prometheus (optional) | http://127.0.0.1:9090 | `docker compose --profile obs up -d prometheus` |
 
 ## The scenario
@@ -47,6 +57,39 @@ Every response also carries `X-Cache-Node` (which of the three nodes owns the ke
 MoCache values are UTF-8 strings over HTTP, so binary objects are stored as `{"ct":…, "b64":…}`. Base64 inflates by 4/3, which is why `MAX_CACHEABLE_BYTES` (384 KiB) sits well under the node's `-max-value` (1 MiB); larger objects are served from origin and marked `X-Cache: TOO_LARGE`.
 
 Cache nodes run deliberately small — `-capacity=20000 -max-bytes=33554432` — so a 67 MiB corpus does not fit in 3 × 32 MiB and you get real evictions instead of a permanently warm cache.
+
+## Redis compatibility
+
+The three cache nodes serve four things at once: HTTP `:8090`, unary RPC `:8091`, and RESP `:6379` in cluster mode, with slots `0-5460` / `5461-10922` / `10923-16383`. The FastAPI app keeps using the SDK's MD5 ring over HTTP; Redis clients use CRC16 slots over RESP. One LRU underneath, two routing schemes that place keys differently — see [../docs/cluster.md](../docs/cluster.md).
+
+`lab/compat/` holds the checks. They are the stock clients, nothing MoCache-specific:
+
+- `compat/py/check.py` — `redis-py`, as `Redis` and as `RedisCluster`
+- `compat/go/main.go` — `go-redis`, as `Client` and as `ClusterClient`, in its own Go module so the library never touches MoCache's `go.mod`
+
+```bash
+docker compose run --rm compat-py --cluster
+docker compose run --rm compat-go -cluster
+# interactive, following redirects:
+docker run --rm -it --network mocache-lab redis:7-alpine redis-cli -c -h cache1 -p 6379
+```
+
+From the host, the published ports (16379-16381) work for **single-node** access, but the nodes announce themselves as `cache1:6379` and so on, so a cluster client on the host cannot follow a `MOVED`. Run cluster clients inside the network (as the compat services do), or use the root `docker-compose.yml`, which announces `127.0.0.1` for exactly this reason.
+
+Things worth trying:
+
+```bash
+# Watch a redirect happen. "abc" is slot 7638, which cache1 does not own.
+printf 'SET hello v\r\nGET abc\r\nQUIT\r\n' | nc 127.0.0.1 16379
+
+# Redirect rate and slot coverage, per node.
+curl -s 127.0.0.1:18090/metrics | grep -E 'mocache_(resp|cluster)'
+
+# A node down takes its slots with it — no failover yet.
+docker compose stop cache2
+docker compose run --rm compat-py --cluster   # expect errors for cache2's third
+docker compose start cache2
+```
 
 ## Benchmark
 

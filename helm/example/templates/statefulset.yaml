@@ -36,11 +36,27 @@ spec:
           args:
             - -http=:{{ .Values.ports.http }}
             - -rpc=:{{ .Values.ports.rpc }}
-            - -capacity={{ .Values.capacity }}
-            - -max-bytes={{ .Values.maxBytes }}
-            - -max-value={{ .Values.maxValue }}
-            - -max-key={{ .Values.maxKey }}
-            - -mem-limit={{ .Values.memLimit }}
+            {{- if .Values.resp.enabled }}
+            - -resp=:{{ .Values.ports.resp }}
+            - -resp-idle={{ .Values.resp.idle }}
+            {{- if .Values.resp.cluster.enabled }}
+            {{- $full := include "mocache.fullname" . }}
+            {{- $ns := .Release.Namespace }}
+            {{- $port := .Values.ports.resp }}
+            {{- $n := int .Values.replicaCount }}
+            # $(POD_NAME) is expanded by the kubelet from the env below, so each
+            # pod announces its own stable DNS name from one shared pod spec.
+            - -cluster-announce=$(POD_NAME).{{ $full }}-headless.{{ $ns }}.svc.cluster.local:{{ $port }}
+            {{- range $i := until $n }}
+            - -cluster-peer={{ $full }}-{{ $i }}.{{ $full }}-headless.{{ $ns }}.svc.cluster.local:{{ $port }}={{ div (mul $i 16384) $n }}-{{ sub (div (mul (add $i 1) 16384) $n) 1 }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            - -capacity={{ int64 .Values.capacity }}
+            - -max-bytes={{ int64 .Values.maxBytes }}
+            - -max-value={{ int64 .Values.maxValue }}
+            - -max-key={{ int64 .Values.maxKey }}
+            - -mem-limit={{ int64 .Values.memLimit }}
             - -drain={{ .Values.drain }}
             - -janitor={{ .Values.janitor }}
             {{- if .Values.accessLog }}
@@ -51,6 +67,17 @@ spec:
             - -otel-service={{ .Values.otel.serviceName }}
             {{- end }}
           env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            {{- if and .Values.resp.enabled .Values.resp.password }}
+            - name: MOCACHE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "mocache.fullname" . }}-auth
+                  key: password
+            {{- end }}
             - name: OTEL_SERVICE_NAME
               value: {{ .Values.otel.serviceName | quote }}
             {{- if .Values.otel.endpoint }}
@@ -62,6 +89,10 @@ spec:
               containerPort: {{ .Values.ports.http }}
             - name: grpc
               containerPort: {{ .Values.ports.rpc }}
+            {{- if .Values.resp.enabled }}
+            - name: resp
+              containerPort: {{ .Values.ports.resp }}
+            {{- end }}
           securityContext:
             {{- toYaml .Values.securityContext.container | nindent 12 }}
           resources:

@@ -38,6 +38,25 @@ janitor: 30s
 ports:
   http: 8090
   rpc: 8091
+  resp: 6379
+
+# Redis-protocol front end (docs/redis.md). Off by default: the port only opens
+# when you ask for it.
+resp:
+  enabled: false
+  # Require AUTH. Stored in a Secret and passed as MOCACHE_PASSWORD, never as a
+  # command-line argument.
+  password: ""
+  idle: 0s
+  # Redis Cluster mode (docs/cluster.md). Slots are divided evenly across
+  # replicaCount pods and each pod announces its own stable DNS name, so
+  # cluster clients can shard across the StatefulSet.
+  #
+  # There is no replication or failover yet: while a pod is down, its share of
+  # the keyspace is unavailable to cluster clients. Changing replicaCount
+  # reassigns slots and drops the keys that move.
+  cluster:
+    enabled: false
 
 service:
   annotations: {}

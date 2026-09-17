@@ -8,6 +8,11 @@ MoCache nodes are **stateless**. Restarts, crashes, and rolling upgrades always 
 |---|---|---|
 | `-http` | `:8090` | HTTP listen address |
 | `-rpc` | `:8091` | Unary RPC listen address; empty disables |
+| `-resp` | *(empty)* | Redis-protocol listen address (`:6379`); empty disables |
+| `-resp-password` | `$MOCACHE_PASSWORD` | Require `AUTH` on the RESP port |
+| `-resp-idle` | `0` | Close idle RESP connections; 0 = never, as in Redis |
+| `-cluster-peer` | *(none)* | `host:port=<slots\|replica-of:host:port>`, repeatable; same list on every node |
+| `-cluster-announce` | *(empty)* | This node's entry in the peer list; required with `-cluster-peer` |
 | `-capacity` | `100000` | Max items (LRU evicts beyond this) |
 | `-max-bytes` | `64Mi` | Max approximate payload bytes |
 | `-max-value` / `-max-key` | `1Mi` / `4Ki` | Reject oversized entries (HTTP 413) |
@@ -23,7 +28,7 @@ MoCache nodes are **stateless**. Restarts, crashes, and rolling upgrades always 
 2. Process sets readiness false → `/readyz` and `/healthz` return 503. `/livez` stays 200 so the kubelet does not SIGKILL a draining pod.
 3. Sleep `-drain` so kube-proxy / CNI can drop Endpoints.
 4. `http.Server.Shutdown` (finish in-flight HTTP, no new conns).
-5. Close the RPC listener and every tracked TCP conn, wait for handler goroutines.
+5. Close the RPC and RESP listeners and every tracked TCP conn, wait for handler goroutines.
 6. Stop the janitor. Exit 0.
 
 `terminationGracePeriodSeconds` must exceed `-drain` plus shutdown (Helm default 30s vs 5s drain).
@@ -47,12 +52,16 @@ PID gone → kubelet restarts the container → empty cache, `/readyz` 200 once 
 
 ## Scaling node count
 
-Manual, both sides:
+Manual, on every side:
 
-1. Change StatefulSet `replicas` **and** the static node list in every SDK.
-2. Expect a hit-rate dip: consistent hashing moves ~1/N keys (virtual nodes reduce hot spots, they do not eliminate moves).
+1. Change StatefulSet `replicas`, **and** the static node list in every SDK, **and** `-cluster-peer` on every node if the RESP port is in use.
+2. Expect a hit-rate dip: consistent hashing moves ~1/N keys (virtual nodes reduce hot spots, they do not eliminate moves). On the RESP side, reassigned slots lose their keys outright.
 
-There is no rebalancing protocol.
+There is no rebalancing protocol and no live slot migration — see [cluster.md](cluster.md).
+
+## Redis-protocol clients
+
+With `-resp` set, the node also serves Redis clients; with `-cluster-peer` it serves them as a sharded cluster. Failure behaviour differs from the SDK path in one way worth planning for: a down node's slots are simply unavailable to cluster clients until it returns, because there is no replication or failover yet. Applications must treat a cache error as a miss, which is the same rule as everywhere else here.
 
 ## Memory
 
