@@ -64,7 +64,20 @@ func main() {
 			Protocol: *proto,
 		})
 	} else {
-		c = redis.NewClient(&redis.Options{Addr: *addr, Protocol: *proto})
+		client := redis.NewClient(&redis.Options{Addr: *addr, Protocol: *proto})
+		// A plain client does not follow MOVED, and the owner of a slot changes
+		// after a failover. Resolve it once so the standalone check stays
+		// meaningful whatever state the cluster is in.
+		if err := client.Set(ctx, "{go}:probe", "1", 0).Err(); err != nil && strings.HasPrefix(err.Error(), "MOVED ") {
+			parts := strings.Fields(err.Error())
+			target := parts[len(parts)-1]
+			fmt.Printf("  (slot moved: following the redirect to %s)\n", target)
+			_ = client.Close()
+			client = redis.NewClient(&redis.Options{Addr: target, Protocol: *proto})
+			*addr = target
+		}
+		client.Del(ctx, "{go}:probe")
+		c = client
 	}
 	defer c.Close()
 

@@ -7,6 +7,7 @@
 nameOverride: cache
 fullnameOverride: ""
 
+# With resp.cluster.enabled, this must equal shards * replicasPerShard.
 replicaCount: 3
 
 image:
@@ -48,15 +49,29 @@ resp:
   # command-line argument.
   password: ""
   idle: 0s
-  # Redis Cluster mode (docs/cluster.md). Slots are divided evenly across
-  # replicaCount pods and each pod announces its own stable DNS name, so
-  # cluster clients can shard across the StatefulSet.
+  # Redis Cluster mode (docs/cluster.md). Slots are divided evenly across the
+  # primaries and each pod announces its own stable DNS name, so cluster
+  # clients can shard across the StatefulSet.
   #
-  # There is no replication or failover yet: while a pod is down, its share of
-  # the keyspace is unavailable to cluster clients. Changing replicaCount
-  # reassigns slots and drops the keys that move.
+  # Changing the shard count reassigns slots and drops the keys that move:
+  # there is no live slot migration.
   cluster:
     enabled: false
+    # Pods per shard. 1 = primaries only: a pod being down takes its slots
+    # with it. 2 = one replica each, which is what makes a shard survive the
+    # loss of its primary.
+    #
+    # replicaCount must equal shards * replicasPerShard, and shards must be
+    # odd and >= 3: a promotion needs a majority of primaries to agree, and an
+    # even number of primaries has no majority after a split.
+    shards: 3
+    replicasPerShard: 2
+    # Gossip, replication and automatic failover on the bus port (client port
+    # + 10000). Disable to keep sharding without replication.
+    bus: true
+    nodeTimeout: 5s
+    failoverDelay: 500ms
+    backlogBytes: 33554432
 
 service:
   annotations: {}

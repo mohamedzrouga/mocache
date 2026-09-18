@@ -37,8 +37,16 @@ Scrape `GET /metrics` (`text/plain; version=0.0.4`).
 | `mocache_cluster_slots_assigned` | gauge |
 | `mocache_cluster_known_nodes` | gauge |
 | `mocache_cluster_my_slots` | gauge |
+| `mocache_cluster_failovers_total` | counter |
+| `mocache_repl_role` | gauge |
+| `mocache_repl_offset` | gauge |
+| `mocache_repl_connected_replicas` | gauge |
+| `mocache_repl_link_up` | gauge |
+| `mocache_repl_full_resyncs_total` | counter |
 | `go_goroutines` | gauge |
 | `go_memstats_alloc_bytes` / `_sys_bytes` / `_heap_inuse_bytes` | gauge |
+
+On a replicated cluster, alert on `mocache_repl_link_up == 0` (a replica that is not receiving its primary's stream is not protecting anything) and on `mocache_cluster_failovers_total` rising when nobody asked for it (the failure detector is too twitchy for the network — raise `-cluster-node-timeout`). A primary's `mocache_repl_connected_replicas` dropping to 0 means the next failure of that node loses its shard.
 
 `mocache_resp_moved_total` is the cluster health signal to alert on: a sustained redirect rate means clients are routing on a stale slot map. `mocache_cluster_slots_assigned` below 16384 means part of the keyspace has no owner.
 

@@ -11,7 +11,11 @@ Cache nodes are independent LRU processes. Go and Python SDKs hash keys onto the
 
 ```
 cmd/mocache          cache-node server
+internal/bus         node-to-node cluster bus
 internal/cache       byte+item capped LRU
+internal/cluster     slots, topology, epochs, votes
+internal/node        clustering runtime: gossip, failover
+internal/repl        replication backlog and streams
 internal/obs         Prometheus, JSON logs, OTLP
 internal/server      HTTP + RPC + drain
 internal/protocol    unary RPC framing
@@ -30,7 +34,7 @@ docs                 operational and API docs
 |---|---|---|---|
 | HTTP | 8090 | MoCache SDK (default) | `/get` `/set` `/delete` `/invalidate` `/livez` `/readyz` `/healthz` `/metrics` |
 | Unary RPC (`grpc`) | 8091 | MoCache SDK | Persistent TCP, length-prefixed frames. Not `google.golang.org/grpc`. |
-| RESP | 6379 | **any Redis client** | RESP2/RESP3, 56 commands, Redis Cluster slots. Off unless `-resp` is set. |
+| RESP | 6379 | **any Redis client** | RESP2/RESP3, 59 commands, Redis Cluster slots, replication and failover. Off unless `-resp` is set. |
 
 The MoCache SDKs route with an MD5 ring; Redis clients route with CRC16 slots. Both reach the same LRU, and they place keys differently — use one scheme per keyspace ([docs/cluster.md](docs/cluster.md)).
 
@@ -69,16 +73,19 @@ r = redis.Redis(host="127.0.0.1", port=6379)   # redis-py, unmodified
 r.set("user:1", "alice", ex=300)
 ```
 
-Sharded across three nodes, every node takes the same peer list:
+Sharded and replicated, every node takes the same peer list:
 
 ```bash
 mocache -resp :6379 -cluster-announce 10.0.0.1:6379 \
   -cluster-peer 10.0.0.1:6379=0-5460 \
   -cluster-peer 10.0.0.2:6379=5461-10922 \
-  -cluster-peer 10.0.0.3:6379=10923-16383
+  -cluster-peer 10.0.0.3:6379=10923-16383 \
+  -cluster-peer 10.0.0.4:6379=replica-of:10.0.0.1:6379 \
+  -cluster-peer 10.0.0.5:6379=replica-of:10.0.0.2:6379 \
+  -cluster-peer 10.0.0.6:6379=replica-of:10.0.0.3:6379
 ```
 
-`RedisCluster` and `ClusterClient` then discover the shards from `CLUSTER SLOTS` and follow `MOVED` — no MoCache-specific code. Strings and TTLs only; no lists, hashes, pub/sub, or scripting. **No replication or failover yet**: a node that is down takes its slots with it. See [docs/redis.md](docs/redis.md) and [docs/cluster.md](docs/cluster.md).
+`RedisCluster` and `ClusterClient` discover the shards from `CLUSTER SLOTS` and follow `MOVED` — no MoCache-specific code. Nodes gossip over a private bus on port + 10000, primaries stream writes to their replicas, and a replica is promoted by majority vote of the primaries when its primary dies (measured at 3-4s in the lab). Strings and TTLs only; no lists, hashes, pub/sub, or scripting, and no live resharding. See [docs/redis.md](docs/redis.md) and [docs/cluster.md](docs/cluster.md).
 
 Verify with the real clients: `make lab-up && make compat`.
 

@@ -194,8 +194,10 @@ func (c *Cache) GetEx(key string, ttl time.Duration, persist bool) ([]byte, bool
 	switch {
 	case persist:
 		e.expireAt = time.Time{}
+		c.emit(Mutation{Kind: MutExpire, Key: key})
 	case ttl > 0:
 		e.expireAt = time.Now().Add(ttl)
+		c.emit(Mutation{Kind: MutExpire, Key: key, ExpireAt: e.expireAt})
 	}
 	c.order.MoveToFront(e.elem)
 	c.hits++
@@ -235,6 +237,7 @@ func (c *Cache) Expire(key string, at time.Time, opt ExpireOptions) bool {
 		return true
 	}
 	e.expireAt = at
+	c.emit(Mutation{Kind: MutExpire, Key: key, ExpireAt: at})
 	return true
 }
 
@@ -247,6 +250,7 @@ func (c *Cache) Persist(key string) bool {
 		return false
 	}
 	e.expireAt = time.Time{}
+	c.emit(Mutation{Kind: MutExpire, Key: key})
 	return true
 }
 
@@ -300,6 +304,7 @@ func (c *Cache) Flush() int {
 	c.order.Init()
 	c.nbytes = 0
 	c.invals += uint64(n)
+	c.emit(Mutation{Kind: MutFlush})
 	return n
 }
 

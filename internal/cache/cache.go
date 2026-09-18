@@ -81,6 +81,8 @@ type Cache struct {
 	invals    uint64
 
 	nextSeq     uint64
+	observer    Observer // replication backlog; see repl.go
+	applying    bool     // true while replaying a primary's stream
 	janitorOnce sync.Once
 	closeOnce   sync.Once
 	stopJanitor chan struct{}
@@ -194,6 +196,7 @@ func (c *Cache) setLocked(key string, v []byte, expireAt time.Time) {
 		e.expireAt = expireAt
 		c.nbytes += newCost
 		c.order.MoveToFront(e.elem)
+		c.emit(Mutation{Kind: MutSet, Key: key, Value: v, ExpireAt: expireAt})
 		c.evictWhileOverLocked()
 		return
 	}
@@ -207,6 +210,7 @@ func (c *Cache) setLocked(key string, v []byte, expireAt time.Time) {
 	e.elem = c.order.PushFront(e)
 	c.items[key] = e
 	c.nbytes += newCost
+	c.emit(Mutation{Kind: MutSet, Key: key, Value: v, ExpireAt: expireAt})
 }
 
 // fits reports whether an entry of this size can be admitted at all.
@@ -349,6 +353,10 @@ func (c *Cache) evictLocked() {
 func (c *Cache) removeLocked(e *entry) {
 	c.order.Remove(e.elem)
 	delete(c.items, e.key)
+	// Evictions and lazy expiry reach here too, and both must propagate: a
+	// replica that keeps an entry its primary dropped answers READONLY reads
+	// with data the primary would report as a miss.
+	c.emit(Mutation{Kind: MutDelete, Key: e.key})
 	c.nbytes -= e.cost
 	if c.nbytes < 0 {
 		c.nbytes = 0

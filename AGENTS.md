@@ -6,14 +6,18 @@ Working notes for coding agents in this repo. Humans: [README.md](README.md) and
 
 MoCache is a memcached-style cache built in-house because Redis/Valkey and other third-party cache products are not an option here. **Nodes are dumb, clients are smart**: each node is an independent LRU process with no knowledge of any other node, and the client picks which node owns a key. No replication, no persistence, no membership protocol — yet. A node restart loses its shard, which the cache design accepts because the data is recomputable.
 
-Since the Redis-compatibility work, a node serves three front ends over one LRU: HTTP, unary RPC, and **RESP on :6379** for stock Redis clients, including Redis Cluster slot routing and `MOVED` redirects. Replication and automatic failover are designed but not built ([docs/cluster.md](docs/cluster.md)).
+Since the Redis-compatibility work, a node serves three front ends over one LRU: HTTP, unary RPC, and **RESP on :6379** for stock Redis clients, with Redis Cluster slot routing and `MOVED` redirects. Nodes also gossip over a private cluster bus, replicate primary to replica, and promote a replica by majority vote when a primary dies ([docs/cluster.md](docs/cluster.md)). Live slot migration is still missing.
 
 ```
 cmd/mocache          cache-node server (flags, drain, wiring)
-internal/cache       byte- and item-capped LRU with TTL, plus the Redis string ops
-internal/cluster     CRC16 slots, hash tags, cluster topology
+internal/bus         node-to-node cluster bus: framing, links, listener
+internal/cache       byte- and item-capped LRU with TTL, Redis string ops, mutation stream
+internal/cluster     CRC16 slots, topology, epochs, votes — the rules, no I/O,
+                     plus the deterministic partition simulation
+internal/node        clustering runtime: gossip loop, failure detection, elections
 internal/obs         Prometheus text, JSON logs, OTLP/HTTP traces
 internal/protocol    unary RPC framing
+internal/repl        replication backlog, snapshots, primary/replica streams
 internal/resp        RESP2/RESP3 codec
 internal/server      HTTP mux, RPC server, RESP server, readiness gate
 sdk/go               Go client (ring + HTTP/RPC transports)
@@ -37,6 +41,10 @@ lab/                 MinIO + FastAPI + benchmark scenario, and the Redis client
 7. **CRC16 must stay CRC-16/XMODEM.** `internal/cluster` hashes keys exactly as Redis does; the check value over `"123456789"` is `0x31C3` and is asserted in the tests. Every Redis client computes slots itself, so a change here does not produce an error — it produces silent misrouting.
 8. **Routing decisions happen before execution.** A command that belongs to another node must return `MOVED` without touching the LRU. Adding a command means giving it correct `first`/`last`/`step` key positions in the table in `internal/server/resp_commands.go`; that table also generates the `COMMAND` reply, so the two cannot drift.
 9. **RESP read-modify-write commands are atomic.** `INCR`, `APPEND`, `SET NX`, `GETDEL` and friends run as one critical section in `internal/cache/ops.go`. Do not reimplement them as Get-then-Set in the server: concurrent clients would lose updates.
+10. **One vote per epoch, majority to promote, highest config epoch wins.** These three rules in `internal/cluster/manager.go` are the only thing preventing two nodes from owning one slot. Do not add a shortcut that promotes without votes (except `CLUSTER FAILOVER TAKEOVER`, which is explicitly the operator accepting that risk), and never let a claim win on an equal epoch.
+11. **The cache lock is held while mutations are emitted.** `cache.emit` runs under `c.mu` so the replicated order is exactly the applied order. Anything hanging off it must be non-blocking: `repl.Primary.Observe` appends to a bounded ring and does non-blocking channel sends, and a replica that cannot keep up is dropped to resynchronise. Never do I/O there.
+12. **Replicate effects and absolute expiry times.** `INCR` ships as the resulting value, not as an instruction to increment, and TTLs travel as absolute instants. Both rules exist so a replica that has drifted cannot compound the drift.
+13. **Anything blocking on a socket needs a wake-up path that is not a write.** A streaming goroutine sitting in a `select` will not notice a closed connection until it next writes; that once made shutdown take five seconds. The ack reader closes a `gone` channel for exactly this reason.
 
 ## Conventions
 
@@ -62,7 +70,11 @@ make lab-bench        # origin-only vs cache-aside benchmark
 make lab-down
 ```
 
-Run `make test` **and** `make test-python` after touching either SDK — ring changes only show up when both suites run. After touching anything under `internal/resp`, `internal/cluster`, or the RESP server, also run `make lab-up && make compat`: Go tests prove the server does what we think, the real clients prove it does what *they* think.
+Run `make test` **and** `make test-python` after touching either SDK — ring changes only show up when both suites run. After touching anything under `internal/resp`, `internal/cluster`, `internal/repl`, `internal/node`, or the RESP server, also run `make lab-up && make compat`: Go tests prove the server does what we think, the real clients prove it does what *they* think. `go-redis` validates that advertised slot ranges sum to exactly 16384, which is how a two-owner bug surfaces — `redis-py` does not check that.
+
+The clustering tests use real TCP on loopback with compressed timings, so run them with `-race`; they are the only place ordering bugs in the bus and the replication stream show up.
+
+`internal/cluster/sim_test.go` is the other half: a deterministic simulation that drives the real state machines over a fake network which delays, reorders and partitions. It takes no wall-clock time, so run the full sweep — `go test -race ./internal/cluster/`; `-short` samples four seeds per scenario instead. A failure prints the seed and the schedule that produced it, and replaying that seed reproduces it exactly. Nothing in it may depend on map iteration order, or that stops being true.
 
 Large integers in Helm values render as `2.68435456e+08` unless passed through `int64`, and the binary rejects that. Keep the `int64` wrapper on numeric args in `templates/statefulset.yaml`.
 
@@ -73,7 +85,9 @@ Large integers in Helm values render as `2.68435456e+08` unless passed through `
 | Ring, hash, or vnode default | Both SDKs, both test suites, `docs/architecture.md` |
 | A RESP command | The table in `internal/server/resp_commands.go` (arity + key positions), `internal/server/resp_test.go`, the command list in `docs/redis.md` |
 | Cluster routing or `CLUSTER` replies | `internal/cluster`, `internal/server/resp_cluster.go`, `docs/cluster.md`, and re-run `make compat` — the real clients are the test that matters |
-| A new cache operation | `internal/cache/ops.go` under one lock, with byte accounting and the size caps |
+| A new cache operation | `internal/cache/ops.go` under one lock, with byte accounting and the size caps; if it changes stored data, make sure it emits a mutation |
+| Failover or replication rules | `internal/cluster/manager.go` (pure, unit-tested in `failover_test.go`), then the multi-node tests in `internal/node/cluster_test.go`, then `docs/cluster.md` |
+| The gossip or election loop in `internal/node` | `internal/cluster/sim_test.go` models that loop — update the model too, or the simulation starts proving things about a runtime we no longer run |
 | HTTP endpoint or status code | `internal/server/http_test.go`, both SDKs, `docs/api.md` |
 | RPC frame layout | `internal/protocol/`, both SDK transports, `docs/protocol.md` — the frame has a magic and a version; bump the version rather than redefining fields |
 | New process flag | `cmd/mocache/main.go`, `docs/operations.md`, `helm/example/values.yaml` + `templates/statefulset.yaml`, `deploy/openshift.yaml`, both compose files |
@@ -90,10 +104,8 @@ The lab is disposable: nothing in it is shipped, and breaking it is cheap. Break
 
 The original design ruled out replication, membership and persistence. That decision has been **partly reversed by the project owner**:
 
-- **Being built:** Redis-protocol compatibility and Redis Cluster sharding — done; see `docs/redis.md`.
-- **Next, designed in `docs/cluster.md`:** replication, gossip failure detection, and failover by majority vote among primaries, following Redis Cluster's model. Bus framing is ours, not Redis's — clients must be compatible, other servers never will be.
+- **Done:** Redis-protocol compatibility, Redis Cluster sharding, replication, gossip failure detection, failover by majority vote among primaries, and a deterministic partition simulation (`internal/cluster/sim_test.go`). Bus framing is ours, not Redis's — clients must be compatible, other servers never will be.
+- **Next, in `docs/cluster.md`:** live slot migration (`CLUSTER SETSLOT`, `MIGRATE`, `-ASK`) and replica migration.
 - **Planned separately:** a native graph engine with GraphQL. It does not belong in the cache node: LRU eviction and TTL would silently corrupt query results, and a graph's data is not recomputable, so it needs durability the cache deliberately lacks. It should be its own binary in this repo, reusing the cluster layer.
 
-Still out of scope: depending on an external cache product, and adding persistence to the **cache** node (a cache restart is expected to come back empty).
-
-When implementing failover, do not skip the epoch/majority machinery to "make it work first". Two nodes claiming one slot is the failure mode the whole design exists to prevent, and it does not show up in a smoke test — it shows up in production, as data that depends on which node you asked.
+Still out of scope: depending on an external cache product, and adding persistence to the **cache** node. Replication buys availability, not durability: a restarted node comes back empty and refills from its primary, and `WAIT` is how a client learns whether a write reached a replica before the primary died.

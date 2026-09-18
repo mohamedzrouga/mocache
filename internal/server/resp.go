@@ -17,11 +17,53 @@ import (
 	"github.com/mohamedzrouga/mocache/internal/resp"
 )
 
+// Runtime is the clustering layer (internal/node) as this server needs it.
+// Declared here as an interface so the RESP server does not depend on the
+// replication and failover machinery — and so tests can run without it.
+type Runtime interface {
+	// Failover implements CLUSTER FAILOVER on a replica.
+	Failover(force, takeover bool) error
+	// ReplicationStatus feeds INFO replication.
+	ReplicationStatus() ReplicationStatus
+	// WaitAcked blocks until n replicas acknowledge offset, or timeout, and
+	// returns how many did. It is the answer to WAIT.
+	WaitAcked(offset uint64, n int, timeout time.Duration) int
+	// MasterOffset is this node's current replication offset.
+	MasterOffset() uint64
+	// Replicate turns this node into a replica of another (CLUSTER REPLICATE).
+	Replicate(nodeID string) error
+}
+
+// ReplicaStatus is one connected replica.
+type ReplicaStatus struct {
+	ID     string
+	Addr   string
+	Offset uint64
+}
+
+// ReplicationStatus is the live replication picture for INFO.
+type ReplicationStatus struct {
+	Role              string
+	MasterHost        string
+	MasterPort        int
+	MasterLinkStatus  string
+	ReplID            string
+	Offset            uint64
+	ConnectedReplicas int
+	Replicas          []ReplicaStatus
+	FullResyncs       uint64
+	SyncedKeys        uint64
+	Failovers         uint64
+}
+
 // RESPOptions configures the Redis-compatible listener.
 type RESPOptions struct {
-	// Topology is the cluster view used for MOVED redirects and the CLUSTER
-	// commands. Nil means standalone: every slot is served locally.
-	Topology *cluster.Topology
+	// Cluster is the live cluster state used for MOVED redirects and the
+	// CLUSTER commands. Nil means standalone: every slot is served locally.
+	Cluster *cluster.Manager
+	// Runtime is the replication/failover layer. Nil disables the commands
+	// that need it, which is how the HTTP-only and test configurations run.
+	Runtime Runtime
 	// Password, when set, requires AUTH (or HELLO ... AUTH) before any command.
 	Password string
 	// Idle closes a connection that has sent nothing for this long. Zero
@@ -41,7 +83,7 @@ type RESPServer struct {
 	cache *cache.Cache
 	gate  *Gate
 	opt   RESPOptions
-	topo  *cluster.Topology
+	mgr   *cluster.Manager
 
 	nextID atomic.Uint64
 	mu     sync.Mutex
@@ -57,15 +99,15 @@ func NewRESP(c *cache.Cache, g *Gate, opt RESPOptions) *RESPServer {
 	if opt.KeysLimit <= 0 {
 		opt.KeysLimit = 100_000
 	}
-	topo := opt.Topology
-	if topo == nil {
-		topo = cluster.Disabled("127.0.0.1", 6379)
+	mgr := opt.Cluster
+	if mgr == nil {
+		mgr = cluster.StandaloneManager("127.0.0.1", 6379)
 	}
 	if g == nil {
 		g = NewGate()
 		g.SetReady(true)
 	}
-	return &RESPServer{cache: c, gate: g, opt: opt, topo: topo, conns: make(map[net.Conn]struct{})}
+	return &RESPServer{cache: c, gate: g, opt: opt, mgr: mgr, conns: make(map[net.Conn]struct{})}
 }
 
 // Serve accepts until the listener is closed.
@@ -225,7 +267,7 @@ const (
 // the client knows how to act on — MOVED makes it retry elsewhere and refresh
 // its slot map, CROSSSLOT tells it to split the command.
 func (c *respConn) route(spec *cmdSpec, args [][]byte) (routeCode, string) {
-	if !c.s.topo.Enabled() {
+	if !c.s.view().Enabled() {
 		return routeLocal, ""
 	}
 	keys := spec.keysOf(args)
@@ -238,17 +280,17 @@ func (c *respConn) route(spec *cmdSpec, args [][]byte) (routeCode, string) {
 			return routeCrossSlot, "CROSSSLOT Keys in request don't hash to the same slot"
 		}
 	}
-	if c.s.topo.Mine(slot) {
+	if c.s.view().Mine(slot) {
 		return routeLocal, ""
 	}
-	owner := c.s.topo.OwnerOf(slot)
+	owner := c.s.view().OwnerOf(slot)
 	if owner == nil {
 		return routeDown, "CLUSTERDOWN Hash slot not served"
 	}
 	// A replica may serve its primary's slots for reads once the client has
 	// sent READONLY; writes always go to the primary.
 	if c.readonly && !spec.write {
-		me := c.s.topo.Myself()
+		me := c.s.view().Myself()
 		if me.Role == cluster.RoleReplica && me.PrimaryO == owner.Addr() {
 			return routeLocal, ""
 		}
@@ -270,6 +312,11 @@ func (s *RESPServer) connCount() int {
 	defer s.mu.Unlock()
 	return len(s.conns)
 }
+
+// view is the current cluster snapshot. Read per command: a failover can change
+// slot ownership between two commands on the same connection, and the next
+// MOVED must point at the new owner.
+func (s *RESPServer) view() *cluster.Topology { return s.mgr.View() }
 
 // globMatchString exposes the cache's glob matcher to CONFIG GET patterns.
 func globMatchString(pattern, s string) bool { return cache.GlobMatch(pattern, s) }

@@ -13,6 +13,11 @@ MoCache nodes are **stateless**. Restarts, crashes, and rolling upgrades always 
 | `-resp-idle` | `0` | Close idle RESP connections; 0 = never, as in Redis |
 | `-cluster-peer` | *(none)* | `host:port=<slots\|replica-of:host:port>`, repeatable; same list on every node |
 | `-cluster-announce` | *(empty)* | This node's entry in the peer list; required with `-cluster-peer` |
+| `-cluster-bus` | `true` | Gossip, replication and automatic failover on client port + 10000 |
+| `-cluster-bus-addr` | *(derived)* | Override the bus listen address |
+| `-cluster-node-timeout` | `5s` | Peer silence before it is suspected |
+| `-cluster-failover-delay` | `500ms` | Base wait before a replica stands for election |
+| `-repl-backlog-bytes` | `32Mi` | Replication backlog per primary |
 | `-capacity` | `100000` | Max items (LRU evicts beyond this) |
 | `-max-bytes` | `64Mi` | Max approximate payload bytes |
 | `-max-value` / `-max-key` | `1Mi` / `4Ki` | Reject oversized entries (HTTP 413) |
@@ -61,7 +66,11 @@ There is no rebalancing protocol and no live slot migration — see [cluster.md]
 
 ## Redis-protocol clients
 
-With `-resp` set, the node also serves Redis clients; with `-cluster-peer` it serves them as a sharded cluster. Failure behaviour differs from the SDK path in one way worth planning for: a down node's slots are simply unavailable to cluster clients until it returns, because there is no replication or failover yet. Applications must treat a cache error as a miss, which is the same rule as everywhere else here.
+With `-resp` set, the node also serves Redis clients; with `-cluster-peer` it serves them as a sharded cluster, and with the cluster bus running it replicates and fails over ([cluster.md](cluster.md)).
+
+Failure behaviour depends on whether the shard has a replica. With one, a killed primary is replaced in a few seconds and clients follow the `MOVED`. Without one, that shard's keys are unavailable until the node returns. Either way, applications must treat a cache error as a miss — the same rule as everywhere else here.
+
+A rolling restart is safe shard by shard. Do not restart a primary and its replica at the same time, and do not run an even number of primaries: a promotion needs a majority of them, so two primaries can never agree after a split.
 
 ## Memory
 

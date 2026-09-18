@@ -43,12 +43,34 @@ spec:
             {{- $full := include "mocache.fullname" . }}
             {{- $ns := .Release.Namespace }}
             {{- $port := .Values.ports.resp }}
-            {{- $n := int .Values.replicaCount }}
+            {{- $shards := int .Values.resp.cluster.shards }}
+            {{- $per := int .Values.resp.cluster.replicasPerShard }}
+            {{- $want := mul $shards $per }}
+            {{- if ne (int .Values.replicaCount) $want }}
+            {{- fail (printf "replicaCount is %d but shards * replicasPerShard is %d: every pod must have a slot range or a primary to follow" (int .Values.replicaCount) $want) }}
+            {{- end }}
+            {{- if lt $shards 3 }}
+            {{- fail "resp.cluster.shards must be at least 3: a failover needs a majority of primaries to agree" }}
+            {{- end }}
             # $(POD_NAME) is expanded by the kubelet from the env below, so each
             # pod announces its own stable DNS name from one shared pod spec.
             - -cluster-announce=$(POD_NAME).{{ $full }}-headless.{{ $ns }}.svc.cluster.local:{{ $port }}
-            {{- range $i := until $n }}
-            - -cluster-peer={{ $full }}-{{ $i }}.{{ $full }}-headless.{{ $ns }}.svc.cluster.local:{{ $port }}={{ div (mul $i 16384) $n }}-{{ sub (div (mul (add $i 1) 16384) $n) 1 }}
+            {{- if .Values.resp.cluster.bus }}
+            - -cluster-node-timeout={{ .Values.resp.cluster.nodeTimeout }}
+            - -cluster-failover-delay={{ .Values.resp.cluster.failoverDelay }}
+            - -repl-backlog-bytes={{ int64 .Values.resp.cluster.backlogBytes }}
+            {{- else }}
+            - -cluster-bus=false
+            {{- end }}
+            {{- /* Ordinals 0..shards-1 are the primaries and take the slot ranges;
+                   the rest follow one of them, so pod N replicates pod N mod shards. */}}
+            {{- range $i := until (int .Values.replicaCount) }}
+            {{- $dns := printf "%s-%d.%s-headless.%s.svc.cluster.local:%v" $full $i $full $ns $port }}
+            {{- if lt $i $shards }}
+            - -cluster-peer={{ $dns }}={{ div (mul $i 16384) $shards }}-{{ sub (div (mul (add $i 1) 16384) $shards) 1 }}
+            {{- else }}
+            - -cluster-peer={{ $dns }}=replica-of:{{ printf "%s-%d.%s-headless.%s.svc.cluster.local:%v" $full (mod $i $shards) $full $ns $port }}
+            {{- end }}
             {{- end }}
             {{- end }}
             {{- end }}
@@ -92,6 +114,11 @@ spec:
             {{- if .Values.resp.enabled }}
             - name: resp
               containerPort: {{ .Values.ports.resp }}
+            {{- end }}
+            {{- if and .Values.resp.enabled .Values.resp.cluster.enabled .Values.resp.cluster.bus }}
+            # Cluster bus: node-to-node only. Never expose it to clients.
+            - name: bus
+              containerPort: {{ add (int .Values.ports.resp) 10000 }}
             {{- end }}
           securityContext:
             {{- toYaml .Values.securityContext.container | nindent 12 }}

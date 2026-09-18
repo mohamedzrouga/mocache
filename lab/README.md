@@ -38,7 +38,8 @@ From the repo root the same flow is `make lab-up`, `make lab-seed`, `make lab-be
 | MinIO console | http://127.0.0.1:9001 | `minioadmin` / `minioadmin` |
 | MinIO S3 | http://127.0.0.1:9000 | bucket `lab` |
 | cache1/2/3 metrics | :18090 / :18092 / :18094 | `curl -s 127.0.0.1:18090/metrics` |
-| cache1/2/3 RESP | :16379 / :16380 / :16381 | `redis-cli -p 16379` (see the note below) |
+| cache1-3 RESP (primaries) | :16379 / :16380 / :16381 | `redis-cli -p 16379` (see the note below) |
+| cache4-6 RESP (replicas) | :16382 / :16383 / :16384 | replicas of cache1/2/3 |
 | Prometheus (optional) | http://127.0.0.1:9090 | `docker compose --profile obs up -d prometheus` |
 
 ## The scenario
@@ -60,7 +61,7 @@ Cache nodes run deliberately small — `-capacity=20000 -max-bytes=33554432` —
 
 ## Redis compatibility
 
-The three cache nodes serve four things at once: HTTP `:8090`, unary RPC `:8091`, and RESP `:6379` in cluster mode, with slots `0-5460` / `5461-10922` / `10923-16383`. The FastAPI app keeps using the SDK's MD5 ring over HTTP; Redis clients use CRC16 slots over RESP. One LRU underneath, two routing schemes that place keys differently — see [../docs/cluster.md](../docs/cluster.md).
+Six cache nodes: three primaries holding slots `0-5460` / `5461-10922` / `10923-16383`, each with a replica. Every node serves HTTP `:8090`, unary RPC `:8091` and RESP `:6379` at once, and they gossip over the cluster bus on `:16379`. The FastAPI app keeps using the SDK's MD5 ring over HTTP; Redis clients use CRC16 slots over RESP. One LRU underneath, two routing schemes that place keys differently — see [../docs/cluster.md](../docs/cluster.md).
 
 `lab/compat/` holds the checks. They are the stock clients, nothing MoCache-specific:
 

@@ -23,14 +23,14 @@ const entryOverheadEstimate = 96
 var startedAt = time.Now()
 
 func clusterMode(c *respConn) string {
-	if c.s.topo.Enabled() {
+	if c.s.view().Enabled() {
 		return "cluster"
 	}
 	return "standalone"
 }
 
 func cmdCluster(c *respConn, args [][]byte) bool {
-	t := c.s.topo
+	t := c.s.view()
 	switch strings.ToUpper(string(args[1])) {
 	case "INFO":
 		c.w.Verbatim("txt", clusterInfoText(c))
@@ -71,6 +71,44 @@ func cmdCluster(c *respConn, args [][]byte) bool {
 			return true
 		}
 		c.w.Strings(keysInSlot(c, slot, count))
+	case "FAILOVER":
+		if c.s.opt.Runtime == nil {
+			c.w.Error("ERR This instance has cluster support disabled")
+			return true
+		}
+		var force, takeover bool
+		for _, a := range args[2:] {
+			switch strings.ToUpper(string(a)) {
+			case "FORCE":
+				force = true
+			case "TAKEOVER":
+				takeover = true
+			default:
+				c.w.Error("ERR Invalid CLUSTER FAILOVER option")
+				return true
+			}
+		}
+		if err := c.s.opt.Runtime.Failover(force, takeover); err != nil {
+			c.w.Errorf("ERR %v", err)
+			return true
+		}
+		c.w.OK()
+
+	case "REPLICATE":
+		if len(args) != 3 {
+			c.w.Error("ERR wrong number of arguments for 'cluster|replicate' command")
+			return true
+		}
+		if c.s.opt.Runtime == nil {
+			c.w.Error("ERR This instance has cluster support disabled")
+			return true
+		}
+		if err := c.s.opt.Runtime.Replicate(string(args[2])); err != nil {
+			c.w.Errorf("ERR %v", err)
+			return true
+		}
+		c.w.OK()
+
 	case "SLAVES", "REPLICAS":
 		if len(args) != 3 {
 			c.w.Error("ERR wrong number of arguments")
@@ -122,7 +160,7 @@ func keysInSlot(c *respConn, slot, limit int) []string {
 // writeClusterSlots emits the reply every cluster client bootstraps from:
 // [start, end, [ip, port, id, {}], replicas...] per slot range.
 func writeClusterSlots(c *respConn) {
-	t := c.s.topo
+	t := c.s.view()
 	if !t.Enabled() {
 		c.w.Array(0)
 		return
@@ -161,7 +199,7 @@ func writeSlotNode(c *respConn, n *cluster.Node) {
 // writeClusterShards is the Redis 7 view: one entry per shard, with its slot
 // ranges and the health of every node in it.
 func writeClusterShards(c *respConn) {
-	t := c.s.topo
+	t := c.s.view()
 	if !t.Enabled() {
 		c.w.Array(0)
 		return
@@ -209,7 +247,7 @@ func writeClusterShards(c *respConn) {
 //	<id> <ip:port@cport> <flags> <primary> <ping> <pong> <epoch> <link> <slots...>
 func clusterNodesText(c *respConn) string {
 	var b strings.Builder
-	for _, n := range c.s.topo.Nodes() {
+	for _, n := range c.s.view().Nodes() {
 		b.WriteString(nodeLine(c, n))
 		b.WriteByte('\n')
 	}
@@ -217,7 +255,7 @@ func clusterNodesText(c *respConn) string {
 }
 
 func nodeLine(c *respConn, n *cluster.Node) string {
-	t := c.s.topo
+	t := c.s.view()
 	flags := n.Role.String()
 	if n.ID == t.Myself().ID {
 		flags = "myself," + flags
@@ -240,7 +278,7 @@ func nodeLine(c *respConn, n *cluster.Node) string {
 }
 
 func clusterInfoText(c *respConn) string {
-	t := c.s.topo
+	t := c.s.view()
 	enabled := 0
 	state := "ok"
 	assigned := cluster.SlotCount
@@ -275,7 +313,7 @@ func cmdInfo(c *respConn, args [][]byte) bool {
 		section = strings.ToLower(string(args[1]))
 	}
 	st := c.s.cache.Stats()
-	t := c.s.topo
+	t := c.s.view()
 	var b strings.Builder
 	want := func(s string) bool { return section == "all" || section == "default" || section == s }
 
@@ -314,20 +352,8 @@ func cmdInfo(c *respConn, args [][]byte) bool {
 		b.WriteString("\r\n")
 	}
 	if want("replication") {
-		role := "master"
-		if t.Myself().Role == cluster.RoleReplica {
-			role = "slave"
-		}
 		b.WriteString("# Replication\r\n")
-		fmt.Fprintf(&b, "role:%s\r\n", role)
-		fmt.Fprintf(&b, "connected_slaves:%d\r\n", len(t.ReplicasOf(t.Myself())))
-		if role == "slave" {
-			// No replication stream exists yet: say so rather than claim sync.
-			if p := t.PrimaryOf(t.Myself()); p != nil {
-				fmt.Fprintf(&b, "master_host:%s\r\nmaster_port:%d\r\n", p.Host, p.Port)
-			}
-			b.WriteString("master_link_status:down\r\n")
-		}
+		writeReplicationInfo(&b, c)
 		b.WriteString("\r\n")
 	}
 	if want("cluster") {
@@ -346,6 +372,51 @@ func cmdInfo(c *respConn, args [][]byte) bool {
 	}
 	c.w.Verbatim("txt", b.String())
 	return false
+}
+
+// writeReplicationInfo reports the live stream, not the configured intent. If
+// no replication layer is running it says so with master_link_status:down
+// rather than implying a sync that does not exist.
+func writeReplicationInfo(b *strings.Builder, c *respConn) {
+	v := c.s.view()
+	me := v.Myself()
+	role := "master"
+	if me.Role == cluster.RoleReplica {
+		role = "slave"
+	}
+
+	rt := c.s.opt.Runtime
+	if rt == nil {
+		fmt.Fprintf(b, "role:%s\r\n", role)
+		b.WriteString("connected_slaves:0\r\n")
+		if role == "slave" {
+			if p := v.PrimaryOf(me); p != nil {
+				fmt.Fprintf(b, "master_host:%s\r\nmaster_port:%d\r\n", p.Host, p.Port)
+			}
+			b.WriteString("master_link_status:down\r\n")
+		}
+		b.WriteString("master_repl_offset:0\r\n")
+		return
+	}
+
+	st := rt.ReplicationStatus()
+	fmt.Fprintf(b, "role:%s\r\n", st.Role)
+	fmt.Fprintf(b, "connected_slaves:%d\r\n", st.ConnectedReplicas)
+	for i, r := range st.Replicas {
+		fmt.Fprintf(b, "slave%d:addr=%s,state=online,offset=%d,lag=0\r\n", i, r.Addr, r.Offset)
+	}
+	if st.Role == "slave" {
+		fmt.Fprintf(b, "master_host:%s\r\n", st.MasterHost)
+		fmt.Fprintf(b, "master_port:%d\r\n", st.MasterPort)
+		fmt.Fprintf(b, "master_link_status:%s\r\n", st.MasterLinkStatus)
+		fmt.Fprintf(b, "slave_repl_offset:%d\r\n", st.Offset)
+		fmt.Fprintf(b, "slave_read_only:1\r\n")
+		fmt.Fprintf(b, "sync_full:%d\r\n", st.FullResyncs)
+		fmt.Fprintf(b, "synced_keys:%d\r\n", st.SyncedKeys)
+	}
+	fmt.Fprintf(b, "master_replid:%s\r\n", st.ReplID)
+	fmt.Fprintf(b, "master_repl_offset:%d\r\n", st.Offset)
+	fmt.Fprintf(b, "total_failovers:%d\r\n", st.Failovers)
 }
 
 // cmdConfig answers the handful of parameters clients read at connect time.
@@ -367,7 +438,7 @@ func cmdConfig(c *respConn, args [][]byte) bool {
 			"databases":              "1",
 			"save":                   "",
 			"appendonly":             "no",
-			"cluster-enabled":        map[bool]string{true: "yes", false: "no"}[c.s.topo.Enabled()],
+			"cluster-enabled":        map[bool]string{true: "yes", false: "no"}[c.s.view().Enabled()],
 			"proto-max-bulk-len":     strconv.Itoa(16 << 20),
 			"notify-keyspace-events": "",
 		}

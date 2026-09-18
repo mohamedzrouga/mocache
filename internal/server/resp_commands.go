@@ -81,6 +81,9 @@ func init() {
 	register(&cmdSpec{name: "READONLY", arity: 1, run: cmdReadonly})
 	register(&cmdSpec{name: "READWRITE", arity: 1, run: cmdReadwrite})
 	register(&cmdSpec{name: "CLUSTER", arity: -2, run: cmdCluster})
+	register(&cmdSpec{name: "WAIT", arity: 3, run: cmdWait})
+	register(&cmdSpec{name: "REPLICAOF", arity: 3, run: cmdReplicaOf})
+	register(&cmdSpec{name: "SLAVEOF", arity: 3, run: cmdReplicaOf})
 
 	// --- keyspace -----------------------------------------------------------
 	register(&cmdSpec{name: "DEL", arity: -2, first: 1, last: -1, step: 1, write: true, run: cmdDel})
@@ -229,7 +232,7 @@ func cmdHello(c *respConn, args [][]byte) bool {
 	// is encoded in the version the client just asked for.
 	c.w.SetProtocol(proto)
 	role := "master"
-	if c.s.topo.Myself().Role == cluster.RoleReplica {
+	if c.s.view().Myself().Role == cluster.RoleReplica {
 		role = "replica"
 	}
 	c.w.Map(7)
@@ -970,6 +973,44 @@ func cmdMemory(c *respConn, args [][]byte) bool {
 	}
 	c.w.Int(int64(len(key) + c.s.cache.StrLen(key) + entryOverheadEstimate))
 	return false
+}
+
+// WAIT reports how many replicas have acknowledged everything written so far.
+// It is the only way a client can tell whether its write survived the loss of
+// this node — replication is asynchronous, so without WAIT the answer is
+// "probably".
+func cmdWait(c *respConn, args [][]byte) bool {
+	n, err1 := strconv.Atoi(string(args[1]))
+	ms, err2 := strconv.ParseInt(string(args[2]), 10, 64)
+	if err1 != nil || err2 != nil || n < 0 || ms < 0 {
+		c.w.Error("ERR value is not an integer or out of range")
+		return true
+	}
+	if c.s.opt.Runtime == nil {
+		c.w.Int(0) // no replication configured: nobody has acknowledged anything
+		return false
+	}
+	timeout := time.Duration(ms) * time.Millisecond
+	if ms == 0 {
+		// Redis treats 0 as "wait forever"; a cache should not hold a
+		// connection open indefinitely, so this is capped.
+		timeout = 30 * time.Second
+	}
+	offset := c.s.opt.Runtime.MasterOffset()
+	c.w.Int(int64(c.s.opt.Runtime.WaitAcked(offset, n, timeout)))
+	return false
+}
+
+// REPLICAOF is refused in cluster mode, exactly as Redis refuses it: slot
+// ownership is cluster state, so changing it from one connection would leave
+// the rest of the cluster disagreeing. CLUSTER REPLICATE is the supported way.
+func cmdReplicaOf(c *respConn, _ [][]byte) bool {
+	if c.s.view().Enabled() {
+		c.w.Error("ERR REPLICAOF not allowed in cluster mode. Use CLUSTER REPLICATE instead.")
+		return true
+	}
+	c.w.Error("ERR MoCache replication requires cluster mode (-cluster-peer)")
+	return true
 }
 
 func cmdReadonly(c *respConn, _ [][]byte) bool {

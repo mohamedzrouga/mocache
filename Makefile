@@ -37,7 +37,7 @@ BENCH_ARGS ?= --compare
 	image docker-build podman-build docker-run podman-run run \
 	compose-up compose-down \
 	lab-up lab-seed lab-bench lab-sweep lab-stats lab-logs lab-down lab-clean \
-	compat compat-py compat-go redis-cli
+	compat compat-py compat-go redis-cli lab-failover
 
 help:
 	@echo "MoCache"
@@ -68,6 +68,7 @@ help:
 	@echo "  make compat-py      redis-py only (COMPAT_ARGS=--cluster)"
 	@echo "  make compat-go      go-redis only (COMPAT_ARGS=-cluster)"
 	@echo "  make redis-cli      interactive redis-cli against the lab cluster"
+	@echo "  make lab-failover   kill a primary, watch its replica be promoted"
 
 $(BIN_DIR):
 	mkdir -p $(BIN_DIR)
@@ -151,17 +152,38 @@ lab-clean:
 COMPAT_ARGS ?=
 
 compat:
-	$(COMPOSE) -f $(LAB)/docker-compose.yml run --rm compat-py
+	$(COMPOSE) -f $(LAB)/docker-compose.yml run --rm --build compat-py
 	$(COMPOSE) -f $(LAB)/docker-compose.yml run --rm compat-py --cluster
-	$(COMPOSE) -f $(LAB)/docker-compose.yml run --rm compat-go
+	$(COMPOSE) -f $(LAB)/docker-compose.yml run --rm --build compat-go
 	$(COMPOSE) -f $(LAB)/docker-compose.yml run --rm compat-go -cluster
 
 compat-py:
-	$(COMPOSE) -f $(LAB)/docker-compose.yml run --rm compat-py $(COMPAT_ARGS)
+	$(COMPOSE) -f $(LAB)/docker-compose.yml run --rm --build compat-py $(COMPAT_ARGS)
 
 compat-go:
-	$(COMPOSE) -f $(LAB)/docker-compose.yml run --rm compat-go $(COMPAT_ARGS)
+	$(COMPOSE) -f $(LAB)/docker-compose.yml run --rm --build compat-go $(COMPAT_ARGS)
 
 # -c follows MOVED redirects across the three shards.
 redis-cli:
 	docker run --rm -it --network mocache-lab redis:7-alpine redis-cli -c -h cache1 -p 6379
+
+# Kill a primary and watch its replica take over. See lab/README.md.
+lab-failover:
+	@echo "--- before ---"
+	@printf 'SET hello survives\r\nQUIT\r\n' | nc 127.0.0.1 16379
+	@printf 'INFO replication\r\nQUIT\r\n' | nc 127.0.0.1 16382 | grep -E '^(role|master_link_status)'
+	@echo "--- killing cache1 (slots 0-5460) ---"
+	@$(COMPOSE) -f $(LAB)/docker-compose.yml kill cache1 >/dev/null 2>&1
+	@for i in 1 2 3 4 5 6 7 8 9 10; do \
+		sleep 1; \
+		role=$$(printf 'INFO replication\r\nQUIT\r\n' | nc 127.0.0.1 16382 2>/dev/null | grep -m1 '^role:' | tr -d '\r'); \
+		echo "  t+$${i}s cache4 $$role"; \
+		case "$$role" in *master*) break;; esac; \
+	done
+	@echo "--- data on the promoted node, and where cache2 now points ---"
+	@printf 'GET hello\r\nQUIT\r\n' | nc 127.0.0.1 16382
+	@printf 'GET hello\r\nQUIT\r\n' | nc 127.0.0.1 16380
+	@echo "--- restarting cache1; it must stand down ---"
+	@$(COMPOSE) -f $(LAB)/docker-compose.yml start cache1 >/dev/null 2>&1
+	@sleep 5
+	@printf 'INFO replication\r\nQUIT\r\n' | nc 127.0.0.1 16379 | grep -E '^(role|master_host|master_link_status)'

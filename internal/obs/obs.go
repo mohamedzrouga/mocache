@@ -38,7 +38,15 @@ var (
 	respMoved atomic.Uint64
 	respSumNs atomic.Uint64
 
-	// Cluster view, published once at startup by cmd/mocache.
+	// Replication, published on a timer by cmd/mocache.
+	replIsReplica atomic.Bool
+	replOffset    atomic.Uint64
+	replConnected atomic.Int64
+	replLinkUp    atomic.Bool
+	replResyncs   atomic.Uint64
+	replFailovers atomic.Uint64
+
+	// Cluster view, published on a timer by cmd/mocache.
 	clusterOn       atomic.Bool
 	clusterAssigned atomic.Int64
 	clusterKnown    atomic.Int64
@@ -96,6 +104,17 @@ func RecordMoved() { respMoved.Add(1) }
 // RESPConns tracks open Redis-protocol connections.
 func RESPConns(delta int64) { respConns.Add(delta) }
 
+// SetReplicationInfo publishes the live replication state for scraping. Called
+// on a timer because gossip and failover change it at runtime.
+func SetReplicationInfo(isReplica bool, offset uint64, replicas int, linkUp bool, resyncs, failovers uint64) {
+	replIsReplica.Store(isReplica)
+	replOffset.Store(offset)
+	replConnected.Store(int64(replicas))
+	replLinkUp.Store(linkUp)
+	replResyncs.Store(resyncs)
+	replFailovers.Store(failovers)
+}
+
 // SetClusterInfo publishes the static cluster view for scraping.
 func SetClusterInfo(enabled bool, assigned, known, mySlots int) {
 	clusterOn.Store(enabled)
@@ -138,6 +157,12 @@ func WritePrometheus(w io.Writer, st cache.Stats) {
 	p("# HELP mocache_cluster_slots_assigned Slots with an owner across the cluster (16384 = complete).\n# TYPE mocache_cluster_slots_assigned gauge\nmocache_cluster_slots_assigned %d\n", clusterAssigned.Load())
 	p("# HELP mocache_cluster_known_nodes Nodes in this node's cluster view.\n# TYPE mocache_cluster_known_nodes gauge\nmocache_cluster_known_nodes %d\n", clusterKnown.Load())
 	p("# HELP mocache_cluster_my_slots Slots served by this node.\n# TYPE mocache_cluster_my_slots gauge\nmocache_cluster_my_slots %d\n", clusterMySlots.Load())
+	p("# HELP mocache_repl_role 1 when this node is a replica, 0 when it is a primary.\n# TYPE mocache_repl_role gauge\nmocache_repl_role %d\n", boolGauge(replIsReplica.Load()))
+	p("# HELP mocache_repl_offset Replication offset: a primary's write position, or a replica's applied position.\n# TYPE mocache_repl_offset gauge\nmocache_repl_offset %d\n", replOffset.Load())
+	p("# HELP mocache_repl_connected_replicas Replicas currently streaming from this primary.\n# TYPE mocache_repl_connected_replicas gauge\nmocache_repl_connected_replicas %d\n", replConnected.Load())
+	p("# HELP mocache_repl_link_up 1 when a replica's link to its primary is in sync.\n# TYPE mocache_repl_link_up gauge\nmocache_repl_link_up %d\n", boolGauge(replLinkUp.Load()))
+	p("# HELP mocache_repl_full_resyncs_total Full resynchronisations this replica has performed.\n# TYPE mocache_repl_full_resyncs_total counter\nmocache_repl_full_resyncs_total %d\n", replResyncs.Load())
+	p("# HELP mocache_cluster_failovers_total Slot-ownership changes this node has applied.\n# TYPE mocache_cluster_failovers_total counter\nmocache_cluster_failovers_total %d\n", replFailovers.Load())
 	p("# HELP go_goroutines Number of goroutines.\n# TYPE go_goroutines gauge\ngo_goroutines %d\n", runtime.NumGoroutine())
 	p("# HELP go_memstats_alloc_bytes Bytes allocated and still in use.\n# TYPE go_memstats_alloc_bytes gauge\ngo_memstats_alloc_bytes %d\n", ms.Alloc)
 	p("# HELP go_memstats_sys_bytes Bytes obtained from the OS.\n# TYPE go_memstats_sys_bytes gauge\ngo_memstats_sys_bytes %d\n", ms.Sys)

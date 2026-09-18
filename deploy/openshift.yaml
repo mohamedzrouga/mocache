@@ -19,13 +19,17 @@ spec:
     - name: resp
       port: 6379
       targetPort: resp
+    - name: bus
+      port: 16379
+      targetPort: bus
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
   name: cache
 spec:
-  minAvailable: 2
+  # Keep a majority of primaries available so a failover can still win a vote.
+  minAvailable: 4
   selector:
     matchLabels:
       app: mocache
@@ -38,7 +42,8 @@ metadata:
     app: mocache
 spec:
   serviceName: cache-headless
-  replicas: 3
+  # 3 shards x 2 pods: ordinals 0-2 are primaries, 3-5 their replicas.
+  replicas: 6
   podManagementPolicy: OrderedReady
   selector:
     matchLabels:
@@ -62,18 +67,20 @@ spec:
           args:
             - -http=:8090
             - -rpc=:8091
-            # Redis-protocol front end in cluster mode: the three pods split the
-            # 16384 slots, so redis cluster clients (redis-py RedisCluster,
-            # go-redis ClusterClient) shard across them. $(POD_NAME) comes from
-            # the downward API below, which is how one pod spec gives each pod
-            # its own announce address. See docs/cluster.md — there is no
-            # replication or failover yet, so a pod being down takes its share
-            # of the keyspace with it.
+            # Redis-protocol front end in cluster mode. Pods 0-2 are primaries
+            # splitting the 16384 slots; pods 3-5 replicate them, which is what
+            # lets a shard survive the loss of its primary. $(POD_NAME) comes
+            # from the downward API below: that is how one pod spec gives each
+            # pod its own announce address. See docs/cluster.md.
             - -resp=:6379
             - -cluster-announce=$(POD_NAME).cache-headless:6379
+            - -cluster-node-timeout=5s
             - -cluster-peer=cache-0.cache-headless:6379=0-5460
             - -cluster-peer=cache-1.cache-headless:6379=5461-10921
             - -cluster-peer=cache-2.cache-headless:6379=10922-16383
+            - -cluster-peer=cache-3.cache-headless:6379=replica-of:cache-0.cache-headless:6379
+            - -cluster-peer=cache-4.cache-headless:6379=replica-of:cache-1.cache-headless:6379
+            - -cluster-peer=cache-5.cache-headless:6379=replica-of:cache-2.cache-headless:6379
             - -capacity=100000
             - -max-bytes=268435456
             - -mem-limit=402653184
@@ -91,6 +98,10 @@ spec:
               containerPort: 8091
             - name: resp
               containerPort: 6379
+            # Cluster bus: node-to-node gossip, replication and votes.
+            # Never expose this to clients.
+            - name: bus
+              containerPort: 16379
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

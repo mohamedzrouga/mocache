@@ -295,9 +295,9 @@ func TestRESPAuth(t *testing.T) {
 	}
 }
 
-func clusterTopo(t *testing.T, me string) *cluster.Topology {
+func clusterTopo(t *testing.T, me string) *cluster.Manager {
 	t.Helper()
-	topo, err := cluster.Parse([]string{
+	mgr, err := cluster.NewManager([]string{
 		"127.0.0.1:7001=0-5460",
 		"127.0.0.1:7002=5461-10922",
 		"127.0.0.1:7003=10923-16383",
@@ -306,13 +306,13 @@ func clusterTopo(t *testing.T, me string) *cluster.Topology {
 	if err != nil {
 		t.Fatalf("topology: %v", err)
 	}
-	return topo
+	return mgr
 }
 
 // The routing contract: keys we own are served, keys we do not own get MOVED
 // with the owner's address, and multi-key commands spanning slots are refused.
 func TestRESPClusterRedirects(t *testing.T) {
-	_, addr, _ := startRESP(t, RESPOptions{Topology: clusterTopo(t, "127.0.0.1:7001")})
+	_, addr, _ := startRESP(t, RESPOptions{Cluster: clusterTopo(t, "127.0.0.1:7001")})
 	c := dial(t, addr)
 
 	// Slots: "abc" is 7638 (owned by 7002), "foo" is 12182 (7003), and
@@ -351,7 +351,7 @@ func TestRESPClusterRedirects(t *testing.T) {
 
 // A replica serves its primary's slots only after READONLY, and never for writes.
 func TestRESPReplicaReadonly(t *testing.T) {
-	_, addr, _ := startRESP(t, RESPOptions{Topology: clusterTopo(t, "127.0.0.1:7004")})
+	_, addr, _ := startRESP(t, RESPOptions{Cluster: clusterTopo(t, "127.0.0.1:7004")})
 	c := dial(t, addr)
 
 	if got := c.do("GET", "hello"); got != "-MOVED 866 127.0.0.1:7001" {
@@ -375,7 +375,7 @@ func TestRESPReplicaReadonly(t *testing.T) {
 }
 
 func TestRESPClusterSlotsReply(t *testing.T) {
-	_, addr, _ := startRESP(t, RESPOptions{Topology: clusterTopo(t, "127.0.0.1:7001")})
+	_, addr, _ := startRESP(t, RESPOptions{Cluster: clusterTopo(t, "127.0.0.1:7001")})
 	c := dial(t, addr)
 	reply := c.do("CLUSTER", "SLOTS")
 	// Three ranges, the first carrying a replica entry.

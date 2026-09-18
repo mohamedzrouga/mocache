@@ -36,7 +36,9 @@ func (s SlotRange) String() string {
 	return strconv.Itoa(s.Start) + "-" + strconv.Itoa(s.End)
 }
 
-// Node is one cache process in the cluster view.
+// Node is one cache process in the cluster view. A Node inside a Topology is a
+// read-only snapshot: the Manager rebuilds the whole view rather than mutating
+// nodes in place, so a reader never sees a half-applied topology change.
 type Node struct {
 	ID       string // 40 hex chars, like Redis; derived from Addr so every node agrees
 	Host     string
@@ -44,7 +46,20 @@ type Node struct {
 	Role     Role
 	PrimaryO string // announce address of the primary, when this node is a replica
 	Slots    []SlotRange
+
+	// Live state, meaningful once the cluster bus is running.
+	ConfigEpoch uint64 // version of this node's slot claim; higher wins
+	ReplOffset  uint64 // replication progress, used to rank failover candidates
+	PFail       bool   // we have not heard from it within cluster-node-timeout
+	Fail        bool   // a majority of primaries agree it is gone
+	LinkUp      bool   // our bus link to it is currently connected
 }
+
+// Healthy reports whether the node is believed to be serving.
+func (n *Node) Healthy() bool { return !n.Fail && !n.PFail }
+
+// BusAddr is the cluster-bus address: client port + 10000, as Redis does.
+func (n *Node) BusAddr() string { return net.JoinHostPort(n.Host, strconv.Itoa(n.BusPort())) }
 
 // Addr is the announce address other nodes and clients connect to.
 func (n *Node) Addr() string { return net.JoinHostPort(n.Host, strconv.Itoa(n.Port)) }
@@ -295,4 +310,10 @@ func (t *Topology) State() string {
 		return "ok"
 	}
 	return "fail"
+}
+
+// netJoinHostPort exists so manager.go can build addresses without importing
+// net directly; it must format identically to Node.Addr or IDs will not match.
+func netJoinHostPort(host string, port int) string {
+	return net.JoinHostPort(host, strconv.Itoa(port))
 }

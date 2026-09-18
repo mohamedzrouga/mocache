@@ -2,7 +2,7 @@
 
 MoCache uses **Redis Cluster's key routing**: the keyspace is 16384 slots, a key's slot is `CRC16(key) mod 16384` (or of its `{hash tag}`), and each node owns a range. Stock cluster clients already implement this, so `RedisCluster` and `ClusterClient` shard across MoCache nodes with no MoCache-specific code.
 
-> **Status.** Sharding and client routing work today. **Replication and automatic failover do not exist yet** — a node's slots are unavailable while it is down. The design for both is at the end of this document; it is the next thing to build.
+> **Status.** Sharding, replication and automatic failover all work. Nodes gossip over a private cluster bus, primaries stream their mutations to replicas, and a replica is promoted by majority vote of the primaries when its primary dies. What is *not* built: live slot migration (resharding) and `ASK` redirects — see [Resharding](#resharding).
 
 ## Configuring a cluster
 
@@ -22,6 +22,8 @@ mocache -resp :6379 \
   -cluster-peer cache-3.cache-headless:6379=replica-of:cache-0.cache-headless:6379
 ```
 
+A shard survives the loss of its primary only if it has a replica, and a promotion needs a **majority of primaries** to agree — so run **three or more primaries**, each with at least one replica. With two primaries a split has no majority on either side and nothing can ever be promoted.
+
 The node refuses to start if two peers claim the same slot, if a replica names an unknown primary, or if `-cluster-announce` is not one of the peers — each of those would make clients see two different answers for the same key.
 
 **Node IDs are derived, not random.** A node's 40-character ID is `SHA-1("mocache-node:" + announce address)`, so every node computes the same ID for every peer, and a restart keeps its identity. Redis gossips randomly generated IDs; deriving them is what lets a static configuration be consistent without a membership protocol.
@@ -29,6 +31,60 @@ The node refuses to start if two peers claim the same slot, if a replica names a
 Without `-cluster-peer`, the node is standalone: it answers for every key, reports `cluster_enabled:0`, and never redirects.
 
 The announce address is what clients are redirected to, so it must be reachable **by them** — a pod DNS name inside the cluster, not `localhost`.
+
+## The cluster bus
+
+Beyond the client port, each node listens on **client port + 10000** — the port `CLUSTER NODES` already advertises. That is where nodes gossip, where replicas pull their stream, and where votes are cast. Open it between nodes; never expose it to clients.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `-cluster-bus` | `true` | Run gossip, replication and failover (needs `-cluster-peer`) |
+| `-cluster-bus-addr` | *(derived)* | Override the bus listen address |
+| `-cluster-node-timeout` | `5s` | Peer silence before it is suspected; other timings derive from this |
+| `-cluster-failover-delay` | `500ms` | Base wait before a replica stands for election |
+| `-repl-backlog-bytes` | `32Mi` | Backlog per primary; a replica further behind resynchronises |
+
+Setting `-cluster-bus=false` gives the earlier behaviour: sharding, but no replication and no failover.
+
+## Replication
+
+A replica opens one connection to its primary's bus and receives a snapshot followed by a live stream of mutations. It serves reads after `READONLY` and redirects every write to the primary.
+
+What travels, and why it is shaped this way:
+
+- **Effects, not commands.** `INCR` ships as the resulting value. Replaying a command against a replica that has diverged compounds the divergence; replaying an effect cannot.
+- **Absolute expiry times, not TTLs.** A relative TTL would restart its clock on arrival and the key would outlive the primary's copy by the replication lag.
+- **Evictions and lazy expiry propagate as deletes.** Otherwise a replica keeps answering `READONLY` reads with entries the primary has already dropped.
+- **The backlog is bounded.** A replica that falls further behind than `-repl-backlog-bytes` is disconnected and does a full resync, rather than being allowed to grow the primary's heap. A reconnecting replica that is still within the backlog gets a partial resync instead.
+
+**Replication is asynchronous.** A promoted replica can be missing the last few writes. That is the right trade for a cache, and it is why `WAIT numreplicas timeout` exists: it reports how many replicas have acknowledged everything written so far, and it is the only way a client can know its write survived the loss of the primary.
+
+`INFO replication` reports the live stream — `master_link_status`, `master_repl_offset`, per-replica offsets — not the configured intent.
+
+## Failover
+
+1. A node that has not answered within `-cluster-node-timeout` is marked **PFAIL** locally.
+2. Suspicion travels in the gossip section of every ping. When a **majority of primaries** agree, the node is marked **FAIL** and that decision is broadcast.
+3. Replicas of a failed primary wait a delay ranked by replication offset — the most up-to-date replica waits least, so the best candidate usually stands alone — then claim an election epoch and ask every primary for a vote.
+4. A primary grants **at most one vote per epoch**, and only to a replica of a primary it also believes has failed.
+5. On a majority the replica promotes itself, takes a config epoch higher than the old primary's, claims the slots and broadcasts the new configuration. Clients find it through `MOVED`.
+
+Two properties do the real work. **One vote per epoch** stops two replicas of the same primary from both winning. **Highest config epoch wins** settles every conflicting claim afterwards, including the one that matters most: a primary that returns after being replaced sees a higher epoch on its old slots, stands down, becomes a replica of whoever replaced it, and resynchronises. It never serves those slots again on its old data.
+
+Slot claims are also voided by gossip, not only by the promotion broadcast: a node that missed the broadcast still converges, instead of advertising a second owner for slots it no longer holds.
+
+**A promoted node that restarts takes its promotion back.** Nothing is written to disk, so it comes back with the role its `-cluster-peer` flags describe — a replica — while every other node still holds its promotion at a higher config epoch. It learns of it through gossip and resumes serving those slots at the epoch it was elected at, empty, refilling on misses. Without that, the cluster would redirect clients to a node that disowned the slots and sent them back, which no amount of waiting resolves.
+
+### Manual failover
+
+```
+CLUSTER FAILOVER            # stand for election (the primary must be marked failed)
+CLUSTER FAILOVER FORCE      # stand for election without waiting for that
+CLUSTER FAILOVER TAKEOVER   # promote with no votes at all
+CLUSTER REPLICATE <node-id> # make an empty, slot-less node a replica of another
+```
+
+`TAKEOVER` skips the majority. It is the one command here that can produce two owners for one slot, and it exists for the case where an operator knows something the cluster cannot — a datacentre that is genuinely gone. `REPLICAOF` is refused in cluster mode, exactly as Redis refuses it.
 
 ## What clients see
 
@@ -67,84 +123,37 @@ Pick one scheme per keyspace. Mixing is safe only on a single node, or if you ke
 
 There is none yet. Changing the slot map means changing `-cluster-peer` on every node and restarting them; keys that move are simply lost (they were cache entries). Live migration needs `CLUSTER SETSLOT` with `MIGRATING`/`IMPORTING`, the `MIGRATE` command and `-ASK` redirects — listed below.
 
-## Operating it today
+## Operating it
 
-- **A node down = its slots down.** Clients get connection errors for that third of the keyspace. Applications must already treat a cache error as a miss (`docs/operations.md`); that is what carries you through.
-- **Rolling restarts** lose one shard at a time. `CLUSTER INFO` reports `cluster_state:fail` if the peer list ever leaves a slot unowned.
-- Watch `mocache_resp_moved_total`. A steady rate means clients are routing on a stale map; a spike after a config change is expected and should settle.
-- `mocache_cluster_slots_assigned` should be 16384 on every node.
+- **A primary with a replica survives being killed**; measured in the lab at roughly 3-4 seconds from kill to a promoted replica serving reads, with `-cluster-node-timeout=2s`. Lower the timeout for faster detection at the cost of promoting on transient network blips.
+- **A primary without a replica takes its slots with it** until it returns. Applications must treat a cache error as a miss (`docs/operations.md`); that is what carries you through either way.
+- **Rolling restarts** are safe shard by shard, but do not restart a primary and its replica together.
+- Watch `mocache_resp_moved_total`: a steady rate means clients are routing on a stale map. A spike after a failover is expected and should settle within seconds.
+- `mocache_cluster_slots_assigned` should be 16384 on every node, and `mocache_repl_link_up` should be 1 on every replica.
+- `mocache_cluster_failovers_total` rising when nobody asked for it means the failure detector is too twitchy for the network — raise `-cluster-node-timeout`.
 
 ---
 
-# Design: replication and failover
-
-What follows is **not implemented**. It is the plan for making a shard survive the loss of its primary, using Redis Cluster's model — gossip for failure detection, majority voting among primaries for promotion — as chosen for this project.
+# Design notes
 
 ## Why this model
 
-Automatic promotion without a consensus step is how split-brain happens: two nodes each decide they are the primary for a slot, both accept writes, and the answer to a key depends on which one you asked. Redis and Valkey solve it with an epoch-numbered majority vote among primaries. Matching their model has a second benefit: clients already expect the resulting behaviour, since `MOVED` is how they learn a slot changed hands.
+Automatic promotion without a consensus step is how split-brain happens: two nodes each decide they are the primary for a slot, both accept writes, and the answer to a key depends on which one you asked. Redis and Valkey solve it with an epoch-numbered majority vote among primaries. Matching that model has a second benefit: clients already expect the resulting behaviour, since `MOVED` is how they learn a slot changed hands.
 
-**We need client compatibility, not server compatibility.** No Redis node will ever join a MoCache cluster, so the cluster bus does not have to use Redis's binary bus format — only the client-facing commands must match. The bus can reuse the framing style already in `internal/protocol`, which is far less work than reimplementing Redis's bus.
+**We need client compatibility, not server compatibility.** No Redis node will ever join a MoCache cluster, so the bus does not use Redis's binary cluster-bus format — only the client-facing commands have to match. The bus is a length-prefixed frame with a JSON header and a raw binary body: readable in a packet capture, and no base64 tax on replicated values.
 
-## Replication
+## How it is verified
 
-**Stream, not snapshot-and-hope.** A replica connects to its primary over the bus, receives a full snapshot of live entries (key, value, absolute expiry), then a continuous stream of mutations from a bounded in-memory backlog. Each mutation carries an offset; the replica reports the offset it has applied, which gives both a lag metric and the ordering needed for promotion.
+- `internal/cluster` holds the rules — who may vote, when a claim wins, when a node stands down — as a pure state machine with no I/O, unit-tested directly (`failover_test.go`). Those tests are deterministic.
+- `internal/node` runs real nodes over real TCP on loopback with compressed timings: replication, snapshot resync, promotion on a majority, **no** promotion without one, a returning primary demoting itself, and manual takeover (`cluster_test.go`).
+- `internal/cluster/sim_test.go` is a **deterministic partition simulation**: no network and no wall clock, just the real `Manager` state machines driven from one seeded event queue. It can do what loopback cannot — delay one message past another, cut the cluster in half and heal it while messages are in flight, crash and restart nodes, and run every node on a clock that disagrees with its peers. After *every* event it asserts that no two nodes serve the same slot at the same config epoch, that no view's slot owner ever goes backwards in config epoch, that no primary grants two votes in one epoch, and that no config epoch is claimed twice. A run is a pure function of its seed, so a failure replays.
+- `lab/` runs six containers and the actual Redis clients, so a failover is checked the way a user would see it — kill a container, watch `redis-py` and `go-redis` keep working.
 
-Decisions that matter:
+What that still does **not** cover: the bus framing and the replication stream under an adversarial network — the simulation models ownership decisions, not bytes — and corrupted or forged frames, which nothing here defends against. The simulation also *mirrors* `internal/node`'s loop rather than running it, so the two can drift; a change to the real loop means a change to the model.
 
-- **Replicate effects, not commands.** `INCR` ships as the resulting value, not as "increment". Replaying a command on a replica whose state has diverged silently compounds the divergence; replaying an effect cannot.
-- **Replicate absolute expiry times, not TTLs.** A relative TTL restarts its clock on arrival, so a key would outlive its expiry by the replication lag on every hop.
-- **Propagate evictions as deletes.** The primary evicts under its own memory pressure; without propagation, a replica keeps entries the primary has dropped and a `READONLY` read returns data the primary would report as a miss. This is what Redis does.
-- **The backlog is bounded**, like the OTLP queue: a replica too far behind gets a full resync rather than making the primary buffer without limit.
-- **Acknowledged, not synchronous.** Replication is asynchronous; a promoted replica may be missing the last few writes. For a cache that is acceptable, and it must be stated rather than implied — MoCache still gives no durability guarantee, only availability.
+## What is not built
 
-New commands: `REPLICAOF`/`SLAVEOF` for manual re-pointing, `WAIT` for "how many replicas have my write", and `INFO replication` reporting `master_repl_offset`, `slave_repl_offset`, and `master_link_status` (which today always reports `down`, honestly, because no stream exists).
-
-## Failure detection
-
-Every node opens a bus connection to every other node (a full mesh; fine at the tens-of-nodes scale this targets) on the client port + 10000 — the port already advertised in `CLUSTER NODES`.
-
-1. Nodes exchange `PING`/`PONG` carrying a gossip section: for a random subset of known nodes, their ID, address, flags, config epoch, and slot ownership.
-2. A node that has not answered within `-cluster-node-timeout` is marked **PFAIL** (possible failure) locally.
-3. PFAIL reports travel in the gossip section. When a node sees PFAIL reports from a **majority of primaries**, it marks the node **FAIL** and broadcasts that.
-
-A single node's opinion never removes a primary; that is the property that keeps a network hiccup from triggering a failover.
-
-## Promotion
-
-1. A replica of a FAIL-marked primary waits a rank-based delay — the replica with the most complete replication offset waits least, so the best candidate usually goes first.
-2. It increments `currentEpoch` and asks every primary for a vote for that epoch.
-3. Each primary grants **at most one vote per epoch**, and only for a replica of a node it also considers failed.
-4. With votes from a majority of primaries, the replica promotes itself, takes a new `configEpoch` higher than the old primary's, claims the slots, and broadcasts the new configuration. Clients discover it through `MOVED`.
-5. Conflicting claims are settled by the highest `configEpoch`.
-
-Consequences to design for, not around:
-
-- **An even number of primaries has no majority in a split.** Three or more primaries, always.
-- **A minority partition cannot promote**, and must stop serving its slots rather than serve stale data — `-cluster-require-full-coverage` decides whether the rest of the cluster keeps serving the slots it still owns.
-- **A returning old primary must demote itself** when it sees a higher `configEpoch` for its slots.
-
-## Resharding
-
-Slot migration rides on the same machinery: `CLUSTER SETSLOT <slot> MIGRATING <node>` on the source, `IMPORTING` on the destination, `MIGRATE` to move keys in batches, and `-ASK` redirects (plus `ASKING`) for keys already moved while the slot is in flight. Clients implement `ASK` already; it differs from `MOVED` precisely in that it does not update their slot map.
-
-## How this gets verified
-
-Consensus code cannot be signed off by a smoke test. The plan is a deterministic in-process simulation: a fake network that drops, delays, reorders and partitions messages under a seed, driving real node state machines with a virtual clock. The properties to assert are:
-
-- **Safety:** no two nodes serve the same slot with the same `configEpoch`; no slot has two primaries accepting writes in one epoch.
-- **Liveness:** with a majority partition and messages eventually delivered, the cluster converges to full slot coverage.
-- **Client-visible:** a killed primary leads to `MOVED` pointing at the promoted replica within a bounded time, and writes never succeed on both sides of a partition.
-
-Plus a lab scenario: kill a primary under load from `lab/bench` and report the error window and the hit-ratio dip.
-
-## Order of work
-
-1. Bus transport, mesh connections, PING/PONG with gossip. Topology becomes a swappable immutable snapshot (the read API — `OwnerOf`, `Mine`, `Nodes` — already isolates the RESP layer from this change).
-2. Replication stream: snapshot, backlog, offsets, `INFO replication`, `REPLICAOF`, `WAIT`.
-3. PFAIL/FAIL detection and propagation.
-4. Epochs, voting, promotion, demotion of a returning primary.
-5. The simulation harness, run in CI with many seeds.
-6. Slot migration and `ASK`.
-
-Steps 1–2 are useful on their own: replicas that serve `READONLY` reads and a manual `CLUSTER FAILOVER` are real availability gains, and they are the foundation the voting work sits on.
+- **Live slot migration.** `CLUSTER SETSLOT` with `MIGRATING`/`IMPORTING`, the `MIGRATE` command, and `-ASK` redirects (plus `ASKING`). Until then, changing the slot map means changing `-cluster-peer` everywhere and restarting; keys that move are lost.
+- **Chained replication.** A replica will not serve as another replica's primary; it answers such a subscription with an error rather than handing out offsets it cannot honour.
+- **Replica migration.** Redis moves a spare replica to a shard that has none. Here, a shard whose only replica is gone stays exposed until someone runs `CLUSTER REPLICATE`.
+- **Persistence.** Unchanged and deliberate: a restarted node comes back empty and refills from its primary. Replication buys availability, not durability.

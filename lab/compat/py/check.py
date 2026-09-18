@@ -130,6 +130,26 @@ def cluster_topology(r: RedisCluster) -> None:
     check_true("keyslot is deterministic", r.keyslot("foo") == 12182)
 
 
+def follow_moved(r: redis.Redis, host: str, port: int, protocol: int) -> redis.Redis:
+    """Point a plain client at whichever node currently owns our keyspace.
+
+    A non-cluster client does not follow MOVED, and the owner of a given slot
+    changes after a failover. Resolving it once here keeps the standalone check
+    meaningful whatever state the cluster is in — and proves the redirect
+    carries a usable address.
+    """
+    try:
+        r.set("{compat}:probe", "1")
+        r.delete("{compat}:probe")
+        return r
+    except redis.exceptions.MovedError as e:
+        target = str(e).split()[-1]
+        new_host, _, new_port = target.rpartition(":")
+        print(f"  (slot moved: following the redirect to {target})")
+        r.close()
+        return redis.Redis(host=new_host, port=int(new_port), protocol=protocol)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default=os.environ.get("REDIS_HOST", "cache1"))
@@ -145,6 +165,7 @@ def main() -> int:
         r = RedisCluster(host=args.host, port=args.port, protocol=args.protocol)
     else:
         r = redis.Redis(host=args.host, port=args.port, protocol=args.protocol)
+        r = follow_moved(r, args.host, args.port, args.protocol)
 
     try:
         server(r, args.cluster)

@@ -49,7 +49,9 @@ The only value type is the **string**. There are no lists, hashes, sets, sorted 
 
 **Connection** — `PING` `ECHO` `HELLO` `AUTH` `SELECT` `RESET` `QUIT` `CLIENT` (`ID` `SETNAME` `GETNAME` `SETINFO` `INFO` `LIST`) `COMMAND` (`COUNT` `INFO` `DOCS` `GETKEYS`)
 
-**Server** — `INFO` `CONFIG GET/SET` `TIME` `MEMORY USAGE` `CLUSTER …` `READONLY` `READWRITE`
+**Server** — `INFO` `CONFIG GET/SET` `TIME` `MEMORY USAGE` `READONLY` `READWRITE` `WAIT`
+
+**Cluster** — `CLUSTER INFO/MYID/SLOTS/SHARDS/NODES/KEYSLOT/COUNTKEYSINSLOT/GETKEYSINSLOT/REPLICAS`, `CLUSTER FAILOVER [FORCE|TAKEOVER]`, `CLUSTER REPLICATE`
 
 `COMMAND` output is generated from the same table that drives cluster routing, so what a client introspects cannot drift from what the server accepts.
 
@@ -63,6 +65,8 @@ The only value type is the **string**. There are no lists, hashes, sets, sorted 
 - **`KEYS` is capped** at 100,000 keys per reply. Prefer `SCAN`.
 - **`SCAN` cursors are insertion sequence numbers**, not bucket indexes. The guarantees are Redis's: a key present for the whole scan is returned exactly once; keys added mid-scan may or may not appear; a key deleted and re-added can appear twice.
 - **`FLUSHALL` and `FLUSHDB` are the same command** — one keyspace — and both are synchronous.
+- **`WAIT numreplicas timeout` works**, and matters: replication is asynchronous, so it is the only way to know a write reached a replica before the primary died. A timeout of 0 means "wait forever" in Redis; here it is capped at 30 seconds rather than holding a connection open indefinitely.
+- **`REPLICAOF` is refused in cluster mode**, as in Redis. Use `CLUSTER REPLICATE`.
 - **`INFO` reports `redis_version:7.4.0`** because clients gate features on it, alongside `server_name:mocache` and `mocache_version` so it is clear what is actually answering.
 
 ## Metrics
