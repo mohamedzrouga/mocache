@@ -7,6 +7,7 @@
 nameOverride: cache
 fullnameOverride: ""
 
+# With resp.cluster.enabled, this must equal shards * replicasPerShard.
 replicaCount: 3
 
 image:
@@ -38,6 +39,43 @@ janitor: 30s
 ports:
   http: 8090
   rpc: 8091
+  resp: 6379
+
+# Redis-protocol front end (docs/redis.md). Off by default: the port only opens
+# when you ask for it.
+resp:
+  enabled: false
+  # Require AUTH. Stored in a Secret and passed as MOCACHE_PASSWORD, never as a
+  # command-line argument.
+  password: ""
+  idle: 0s
+  # Redis Cluster mode (docs/cluster.md). Slots are divided evenly across the
+  # primaries and each pod announces its own stable DNS name, so cluster
+  # clients can shard across the StatefulSet.
+  #
+  # Changing the shard count reassigns slots and drops the keys that move:
+  # there is no live slot migration.
+  cluster:
+    enabled: false
+    # Pods per shard. 1 = primaries only: a pod being down takes its slots
+    # with it. 2 = one replica each, which is what makes a shard survive the
+    # loss of its primary.
+    #
+    # replicaCount must equal shards * replicasPerShard, and shards must be
+    # odd and >= 3: a promotion needs a majority of primaries to agree, and an
+    # even number of primaries has no majority after a split.
+    shards: 3
+    replicasPerShard: 2
+    # Gossip, replication and automatic failover on the bus port (client port
+    # + 10000). Disable to keep sharding without replication.
+    bus: true
+    nodeTimeout: 5s
+    failoverDelay: 500ms
+    # Move a spare replica to a shard that has lost all of its own, so one
+    # crash cannot leave a shard unable to fail over. Needs replicasPerShard > 1
+    # somewhere in the cluster to have a spare to move.
+    replicaMigration: true
+    backlogBytes: 33554432
 
 service:
   annotations: {}

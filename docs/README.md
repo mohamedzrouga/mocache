@@ -5,8 +5,11 @@
 | [architecture.md](architecture.md) | Dumb nodes, smart clients, hashing, transports |
 | [api.md](api.md) | HTTP API and health/metrics |
 | [protocol.md](protocol.md) | Unary RPC framing (`grpc` transport) |
+| [redis.md](redis.md) | Redis-protocol (RESP) compatibility on :6379 |
+| [cluster.md](cluster.md) | Slots, MOVED, cluster config — and the replication/failover design |
 | [sdk.md](sdk.md) | Go and Python clients |
 | [operations.md](operations.md) | Rollouts, restarts, crashes, probes |
 | [observability.md](observability.md) | JSON logs, Prometheus, OTEL, memory caps |
 | [build.md](build.md) | Make, Docker, Podman |
 | [helm.md](helm.md) | Example chart (`helm/example`) |
+| [../lab/README.md](../lab/README.md) | Local MinIO + FastAPI + benchmark lab |

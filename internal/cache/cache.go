@@ -37,6 +37,11 @@ type entry struct {
 	cost     int64
 	expireAt time.Time // zero means no expiry
 	elem     *list.Element
+	// seq is a monotonic insertion number. SCAN uses it as a cursor: Go map
+	// iteration order is randomised, so "resume where you left off" needs an
+	// ordering the map itself cannot provide. It is kept across overwrites so
+	// a key that survives a whole scan is returned exactly once.
+	seq uint64
 }
 
 // Stats is a point-in-time snapshot of cache counters.
@@ -75,6 +80,9 @@ type Cache struct {
 	evictions uint64
 	invals    uint64
 
+	nextSeq     uint64
+	observer    Observer // replication backlog; see repl.go
+	applying    bool     // true while replaying a primary's stream
 	janitorOnce sync.Once
 	closeOnce   sync.Once
 	stopJanitor chan struct{}
@@ -172,7 +180,15 @@ func (c *Cache) Set(key string, value []byte, ttl time.Duration) error {
 	if ttl > 0 {
 		expireAt = time.Now().Add(ttl)
 	}
+	c.setLocked(key, v, expireAt)
+	return nil
+}
 
+// setLocked stores an already-private copy of value and keeps both caps and the
+// byte total consistent. Every write path goes through here; callers hold c.mu
+// and must have validated the size limits (see fits).
+func (c *Cache) setLocked(key string, v []byte, expireAt time.Time) {
+	newCost := costOf(key, v)
 	if e, ok := c.items[key]; ok {
 		c.nbytes -= e.cost
 		e.value = v
@@ -180,19 +196,47 @@ func (c *Cache) Set(key string, value []byte, ttl time.Duration) error {
 		e.expireAt = expireAt
 		c.nbytes += newCost
 		c.order.MoveToFront(e.elem)
+		c.emit(Mutation{Kind: MutSet, Key: key, Value: v, ExpireAt: expireAt})
 		c.evictWhileOverLocked()
-		return nil
+		return
 	}
 
 	c.evictWhileOverLocked()
 	for (c.order.Len() >= c.maxItems || c.nbytes+newCost > c.maxBytes) && c.order.Len() > 0 {
 		c.evictLocked()
 	}
-	e := &entry{key: key, value: v, cost: newCost, expireAt: expireAt}
+	c.nextSeq++
+	e := &entry{key: key, value: v, cost: newCost, expireAt: expireAt, seq: c.nextSeq}
 	e.elem = c.order.PushFront(e)
 	c.items[key] = e
 	c.nbytes += newCost
+	c.emit(Mutation{Kind: MutSet, Key: key, Value: v, ExpireAt: expireAt})
+}
+
+// fits reports whether an entry of this size can be admitted at all.
+func (c *Cache) fits(key string, value []byte) error {
+	if len(key) > c.maxKey || len(value) > c.maxValue {
+		return ErrTooLarge
+	}
+	if costOf(key, value) > c.maxBytes {
+		return ErrTooLarge
+	}
 	return nil
+}
+
+// liveLocked returns the entry for key if present and unexpired, dropping it if
+// it has expired. It does not touch hit/miss counters or LRU order: callers
+// decide whether their command counts as a read.
+func (c *Cache) liveLocked(key string) *entry {
+	e, ok := c.items[key]
+	if !ok {
+		return nil
+	}
+	if expired(e, time.Now()) {
+		c.removeLocked(e)
+		return nil
+	}
+	return e
 }
 
 func (c *Cache) Get(key string) ([]byte, bool) {
@@ -309,6 +353,10 @@ func (c *Cache) evictLocked() {
 func (c *Cache) removeLocked(e *entry) {
 	c.order.Remove(e.elem)
 	delete(c.items, e.key)
+	// Evictions and lazy expiry reach here too, and both must propagate: a
+	// replica that keeps an entry its primary dropped answers READONLY reads
+	// with data the primary would report as a miss.
+	c.emit(Mutation{Kind: MutDelete, Key: e.key})
 	c.nbytes -= e.cost
 	if c.nbytes < 0 {
 		c.nbytes = 0

@@ -30,6 +30,18 @@ A single Go binary:
 - HTTP on `-http` (default `:8090`) and unary RPC on `-rpc` (default `:8091`).
 - Process-local only. No disk. A crash or rolling restart starts empty.
 
+## Front ends
+
+One LRU, three listeners:
+
+| Port | Protocol | Routing |
+|---|---|---|
+| 8090 | HTTP | MoCache SDK, MD5 virtual-node ring |
+| 8091 | Unary RPC | MoCache SDK, same ring |
+| 6379 | RESP (Redis) | The Redis client, CRC16 slots |
+
+The Redis port is off unless `-resp` is set. The two routing schemes place keys differently and neither redirects the other's traffic, so a keyspace should be reached through one of them, not both — see [cluster.md](cluster.md).
+
 ## Client routing
 
 Both SDKs build the same MD5 virtual-node ring at construction (`vnodes=100` by default). Node lists are static. Adding or removing a node requires updating every client's config; ~1/N of keys move.
@@ -39,6 +51,8 @@ Go and Python must keep the same:
 1. Virtual-node label `{nodeURL}:{i}`
 2. MD5 digest interpreted as a big-endian unsigned integer
 3. Owner = first ring position **at or after** the key hash (bisect_left), wrapping to 0
+
+An SDK can instead be given a **slot map** and route by CRC16 exactly as a Redis cluster client does, which is the only way one keyspace is reachable from both the SDK and the RESP port — see [sdk.md](sdk.md#routing-ring-or-slots) and [cluster.md](cluster.md#two-routing-schemes-one-cache). The ring above remains the default and is what applies when no slot map is configured.
 
 ## Failure model
 

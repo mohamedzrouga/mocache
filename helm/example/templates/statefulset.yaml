@@ -36,11 +36,50 @@ spec:
           args:
             - -http=:{{ .Values.ports.http }}
             - -rpc=:{{ .Values.ports.rpc }}
-            - -capacity={{ .Values.capacity }}
-            - -max-bytes={{ .Values.maxBytes }}
-            - -max-value={{ .Values.maxValue }}
-            - -max-key={{ .Values.maxKey }}
-            - -mem-limit={{ .Values.memLimit }}
+            {{- if .Values.resp.enabled }}
+            - -resp=:{{ .Values.ports.resp }}
+            - -resp-idle={{ .Values.resp.idle }}
+            {{- if .Values.resp.cluster.enabled }}
+            {{- $full := include "mocache.fullname" . }}
+            {{- $ns := .Release.Namespace }}
+            {{- $port := .Values.ports.resp }}
+            {{- $shards := int .Values.resp.cluster.shards }}
+            {{- $per := int .Values.resp.cluster.replicasPerShard }}
+            {{- $want := mul $shards $per }}
+            {{- if ne (int .Values.replicaCount) $want }}
+            {{- fail (printf "replicaCount is %d but shards * replicasPerShard is %d: every pod must have a slot range or a primary to follow" (int .Values.replicaCount) $want) }}
+            {{- end }}
+            {{- if lt $shards 3 }}
+            {{- fail "resp.cluster.shards must be at least 3: a failover needs a majority of primaries to agree" }}
+            {{- end }}
+            # $(POD_NAME) is expanded by the kubelet from the env below, so each
+            # pod announces its own stable DNS name from one shared pod spec.
+            - -cluster-announce=$(POD_NAME).{{ $full }}-headless.{{ $ns }}.svc.cluster.local:{{ $port }}
+            {{- if .Values.resp.cluster.bus }}
+            - -cluster-node-timeout={{ .Values.resp.cluster.nodeTimeout }}
+            - -cluster-failover-delay={{ .Values.resp.cluster.failoverDelay }}
+            - -cluster-replica-migration={{ .Values.resp.cluster.replicaMigration }}
+            - -repl-backlog-bytes={{ int64 .Values.resp.cluster.backlogBytes }}
+            {{- else }}
+            - -cluster-bus=false
+            {{- end }}
+            {{- /* Ordinals 0..shards-1 are the primaries and take the slot ranges;
+                   the rest follow one of them, so pod N replicates pod N mod shards. */}}
+            {{- range $i := until (int .Values.replicaCount) }}
+            {{- $dns := printf "%s-%d.%s-headless.%s.svc.cluster.local:%v" $full $i $full $ns $port }}
+            {{- if lt $i $shards }}
+            - -cluster-peer={{ $dns }}={{ div (mul $i 16384) $shards }}-{{ sub (div (mul (add $i 1) 16384) $shards) 1 }}
+            {{- else }}
+            - -cluster-peer={{ $dns }}=replica-of:{{ printf "%s-%d.%s-headless.%s.svc.cluster.local:%v" $full (mod $i $shards) $full $ns $port }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            - -capacity={{ int64 .Values.capacity }}
+            - -max-bytes={{ int64 .Values.maxBytes }}
+            - -max-value={{ int64 .Values.maxValue }}
+            - -max-key={{ int64 .Values.maxKey }}
+            - -mem-limit={{ int64 .Values.memLimit }}
             - -drain={{ .Values.drain }}
             - -janitor={{ .Values.janitor }}
             {{- if .Values.accessLog }}
@@ -51,6 +90,17 @@ spec:
             - -otel-service={{ .Values.otel.serviceName }}
             {{- end }}
           env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            {{- if and .Values.resp.enabled .Values.resp.password }}
+            - name: MOCACHE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "mocache.fullname" . }}-auth
+                  key: password
+            {{- end }}
             - name: OTEL_SERVICE_NAME
               value: {{ .Values.otel.serviceName | quote }}
             {{- if .Values.otel.endpoint }}
@@ -62,6 +112,15 @@ spec:
               containerPort: {{ .Values.ports.http }}
             - name: grpc
               containerPort: {{ .Values.ports.rpc }}
+            {{- if .Values.resp.enabled }}
+            - name: resp
+              containerPort: {{ .Values.ports.resp }}
+            {{- end }}
+            {{- if and .Values.resp.enabled .Values.resp.cluster.enabled .Values.resp.cluster.bus }}
+            # Cluster bus: node-to-node only. Never expose it to clients.
+            - name: bus
+              containerPort: {{ add (int .Values.ports.resp) 10000 }}
+            {{- end }}
           securityContext:
             {{- toYaml .Values.securityContext.container | nindent 12 }}
           resources:

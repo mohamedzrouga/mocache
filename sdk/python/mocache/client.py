@@ -67,6 +67,96 @@ class HashRing:
         return self._ring[self._keys[idx]]
 
 
+SLOT_COUNT: Final = 16384
+
+
+def _crc16(data: bytes) -> int:
+    """CRC-16/XMODEM (poly 0x1021, zero init, no reflection) — Redis's variant.
+
+    Its check value over b"123456789" is 0x31C3, asserted in the tests. A client
+    that computes slots differently does not raise, it silently misroutes.
+    """
+    crc = 0
+    for b in data:
+        crc ^= b << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x1021) & 0xFFFF if crc & 0x8000 else (crc << 1) & 0xFFFF
+    return crc
+
+
+def hash_tag(key: str) -> str:
+    """Substring between the first '{' and the next '}', when non-empty; else the key.
+
+    It is how a caller forces related keys onto one node ("{user:1}:name").
+    """
+    open_at = key.find("{")
+    if open_at < 0:
+        return key
+    closing = key.find("}", open_at + 1)
+    if closing <= open_at + 1:
+        return key
+    return key[open_at + 1 : closing]
+
+
+def key_slot(key: str) -> int:
+    """CRC16 of the hash tag modulo 16384 — the slot every Redis client computes."""
+    return _crc16(hash_tag(key).encode("utf-8")) % SLOT_COUNT
+
+
+def parse_slot_ranges(spec: str) -> list[tuple[int, int]]:
+    """Read the slot list form -cluster-peer uses: "0-5460" or "5461-10922,12000-12100"."""
+    out: list[tuple[int, int]] = []
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        lo, sep, hi = part.partition("-")
+        try:
+            start = int(lo.strip())
+            end = int(hi.strip()) if sep else start
+        except ValueError:
+            raise ValueError(f"bad slot range {part!r}") from None
+        if start < 0 or end >= SLOT_COUNT or start > end:
+            raise ValueError(f"slot range {part!r} outside 0-{SLOT_COUNT - 1}")
+        out.append((start, end))
+    if not out:
+        raise ValueError(f"no slots in {spec!r}")
+    return out
+
+
+class SlotRouter:
+    """Redis Cluster slot routing; identical to the Go SDK's slotRouter.
+
+    The SDK's hash ring and a Redis client's CRC16 slots do not agree on where a
+    key belongs, so a key written through this SDK and read through redis-py can
+    land on different nodes and read as a miss. Routing by slots is what lets one
+    keyspace be shared by both access paths.
+
+    The map is static. It does not follow a failover: afterwards the promoted
+    shard's slots are served by a node the map does not name, and lookups miss
+    until it is updated. A client that must track failover should use the RESP
+    port with a real cluster client, which follows MOVED.
+    """
+
+    def __init__(self, slots: dict[str, str]) -> None:
+        owner: list[str | None] = [None] * SLOT_COUNT
+        # Sorted so a duplicate is always reported against the same pair of
+        # nodes, whichever order the caller built the mapping in.
+        for node in sorted(slots):
+            for start, end in parse_slot_ranges(slots[node]):
+                for slot in range(start, end + 1):
+                    if owner[slot] is not None:
+                        raise ValueError(f"slot {slot} claimed by both {owner[slot]} and {node}")
+                    owner[slot] = node
+        missing = owner.index(None) if None in owner else -1
+        if missing >= 0:
+            raise ValueError(f"slot {missing} has no node; the map must cover all {SLOT_COUNT} slots")
+        self._owner: list[str] = owner  # type: ignore[assignment]
+
+    def node(self, key: str) -> str:
+        return self._owner[key_slot(key)]
+
+
 class MoCacheClient:
     """Synchronous client. Safe to share across threads (one mutex per RPC node).
 
@@ -79,10 +169,13 @@ class MoCacheClient:
         timeout: float = 1.0,
         protocol: str = "http",
         rpc_port: int = 8091,
+        slots: dict[str, str] | None = None,
     ) -> None:
         if protocol not in ("http", "grpc"):
             raise ValueError("protocol must be 'http' or 'grpc'")
-        self._ring = HashRing(nodes, vnodes)
+        # slots routes by CRC16 like a Redis client; without it the MD5 ring
+        # stays the default, so an existing deployment's keys do not move.
+        self._ring: HashRing | SlotRouter = SlotRouter(slots) if slots else HashRing(nodes, vnodes)
         self._nodes = list(nodes)
         self._timeout = timeout
         self._protocol = protocol

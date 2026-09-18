@@ -1,0 +1,294 @@
+# MoCache lab: MinIO (S3) <- FastAPI cache-aside API -> 3 MoCache nodes, plus a
+# load generator and the Redis-client compatibility checks.
+# Run from this directory (see lab/README.md):
+#
+#   docker compose up -d --build        # minio + 3 cache nodes + api
+#   docker compose run --rm seed        # upload random objects to MinIO
+#   docker compose run --rm bench --compare
+#   docker compose run --rm compat-py --cluster    # real redis-py against the cluster
+#   docker compose run --rm compat-go -cluster     # real go-redis against the cluster
+#
+# Six cache nodes: three primaries (slots 0-5460 / 5461-10922 / 10923-16383)
+# each with one replica, gossiping over the cluster bus on :16379. Kill a
+# primary and its replica is promoted by majority vote — see the failover
+# scenario in lab/README.md.
+#
+# Each node serves all front ends at once: HTTP :8090, unary RPC :8091, RESP
+# :6379. Slot routing and MOVED apply only to the RESP port — the FastAPI app
+# keeps using the SDK's own MD5 ring over HTTP, and the two coexist on one LRU.
+#
+# Host ports are offset (18090+) so this stack can run next to the root
+# docker-compose.yml without colliding.
+name: mocache-lab
+
+x-cache-node: &cache-node
+  build:
+    context: ..
+    dockerfile: Dockerfile
+  image: mocache:0.1.0
+  # Deliberately small: 20k items / 32Mi forces evictions once the working set
+  # grows, so the benchmark shows a realistic hit ratio instead of a warm 100%.
+  command: []   # per-node; see each service below
+  restart: unless-stopped
+  stop_grace_period: 30s
+  mem_limit: 192m
+  read_only: true
+  security_opt: [no-new-privileges:true]
+  cap_drop: [ALL]
+  networks: [lab]
+
+x-s3-env: &s3-env
+  S3_ENDPOINT: http://minio:9000
+  S3_BUCKET: ${S3_BUCKET:-lab}
+  AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+  AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+  AWS_DEFAULT_REGION: us-east-1
+
+services:
+  minio:
+    image: quay.io/minio/minio:latest
+    container_name: lab-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # console: http://127.0.0.1:9001
+    volumes:
+      - minio-data:/data
+    restart: unless-stopped
+    networks: [lab]
+
+  cache1:
+    <<: *cache-node
+    container_name: lab-cache1
+    command:
+      - -http=:8090
+      - -rpc=:8091
+      - -resp=:6379
+      - -cluster-announce=cache1:6379
+      - -cluster-peer=cache1:6379=0-5460,cache2:6379=5461-10922,cache3:6379=10923-16383,cache4:6379=replica-of:cache1:6379,cache5:6379=replica-of:cache2:6379,cache6:6379=replica-of:cache3:6379
+      - -cluster-node-timeout=2s
+      - -cluster-failover-delay=300ms
+      - -cluster-replica-migration=true
+      - -capacity=20000
+      - -max-bytes=33554432
+      - -max-value=1048576
+      - -mem-limit=100663296
+      - -drain=5s
+      - -janitor=30s
+    ports: ["18090:8090", "16379:6379"]
+
+  cache2:
+    <<: *cache-node
+    container_name: lab-cache2
+    command:
+      - -http=:8090
+      - -rpc=:8091
+      - -resp=:6379
+      - -cluster-announce=cache2:6379
+      - -cluster-peer=cache1:6379=0-5460,cache2:6379=5461-10922,cache3:6379=10923-16383,cache4:6379=replica-of:cache1:6379,cache5:6379=replica-of:cache2:6379,cache6:6379=replica-of:cache3:6379
+      - -cluster-node-timeout=2s
+      - -cluster-failover-delay=300ms
+      - -cluster-replica-migration=true
+      - -capacity=20000
+      - -max-bytes=33554432
+      - -max-value=1048576
+      - -mem-limit=100663296
+      - -drain=5s
+      - -janitor=30s
+    ports: ["18092:8090", "16380:6379"]
+
+  cache3:
+    <<: *cache-node
+    container_name: lab-cache3
+    command:
+      - -http=:8090
+      - -rpc=:8091
+      - -resp=:6379
+      - -cluster-announce=cache3:6379
+      - -cluster-peer=cache1:6379=0-5460,cache2:6379=5461-10922,cache3:6379=10923-16383,cache4:6379=replica-of:cache1:6379,cache5:6379=replica-of:cache2:6379,cache6:6379=replica-of:cache3:6379
+      - -cluster-node-timeout=2s
+      - -cluster-failover-delay=300ms
+      - -cluster-replica-migration=true
+      - -capacity=20000
+      - -max-bytes=33554432
+      - -max-value=1048576
+      - -mem-limit=100663296
+      - -drain=5s
+      - -janitor=30s
+    ports: ["18094:8090", "16381:6379"]
+
+  cache4:
+    <<: *cache-node
+    container_name: lab-cache4
+    command:
+      - -http=:8090
+      - -rpc=:8091
+      - -resp=:6379
+      - -cluster-announce=cache4:6379
+      - -cluster-peer=cache1:6379=0-5460,cache2:6379=5461-10922,cache3:6379=10923-16383,cache4:6379=replica-of:cache1:6379,cache5:6379=replica-of:cache2:6379,cache6:6379=replica-of:cache3:6379
+      - -cluster-node-timeout=2s
+      - -cluster-failover-delay=300ms
+      - -cluster-replica-migration=true
+      - -capacity=20000
+      - -max-bytes=33554432
+      - -max-value=1048576
+      - -mem-limit=100663296
+      - -drain=5s
+      - -janitor=30s
+    ports: ["18096:8090", "16382:6379"]
+
+  cache5:
+    <<: *cache-node
+    container_name: lab-cache5
+    command:
+      - -http=:8090
+      - -rpc=:8091
+      - -resp=:6379
+      - -cluster-announce=cache5:6379
+      - -cluster-peer=cache1:6379=0-5460,cache2:6379=5461-10922,cache3:6379=10923-16383,cache4:6379=replica-of:cache1:6379,cache5:6379=replica-of:cache2:6379,cache6:6379=replica-of:cache3:6379
+      - -cluster-node-timeout=2s
+      - -cluster-failover-delay=300ms
+      - -cluster-replica-migration=true
+      - -capacity=20000
+      - -max-bytes=33554432
+      - -max-value=1048576
+      - -mem-limit=100663296
+      - -drain=5s
+      - -janitor=30s
+    ports: ["18098:8090", "16383:6379"]
+
+  cache6:
+    <<: *cache-node
+    container_name: lab-cache6
+    command:
+      - -http=:8090
+      - -rpc=:8091
+      - -resp=:6379
+      - -cluster-announce=cache6:6379
+      - -cluster-peer=cache1:6379=0-5460,cache2:6379=5461-10922,cache3:6379=10923-16383,cache4:6379=replica-of:cache1:6379,cache5:6379=replica-of:cache2:6379,cache6:6379=replica-of:cache3:6379
+      - -cluster-node-timeout=2s
+      - -cluster-failover-delay=300ms
+      - -cluster-replica-migration=true
+      - -capacity=20000
+      - -max-bytes=33554432
+      - -max-value=1048576
+      - -mem-limit=100663296
+      - -drain=5s
+      - -janitor=30s
+    ports: ["18100:8090", "16384:6379"]
+
+  # One-shot: create the bucket and upload OBJECT_COUNT random objects.
+  seed:
+    build:
+      context: ..
+      dockerfile: lab/api/Dockerfile
+    image: mocache-lab-api:0.1.0
+    container_name: lab-seed
+    profiles: [tools]
+    depends_on: [minio]
+    environment:
+      <<: *s3-env
+      OBJECT_COUNT: ${OBJECT_COUNT:-2000}
+      OBJECT_MIN_BYTES: ${OBJECT_MIN_BYTES:-4096}
+      OBJECT_MAX_BYTES: ${OBJECT_MAX_BYTES:-65536}
+      SEED: ${SEED:-1}
+      FORCE: ${FORCE:-0}
+    command: ["python", "-u", "seed.py"]
+    networks: [lab]
+
+  api:
+    build:
+      context: ..
+      dockerfile: lab/api/Dockerfile
+    image: mocache-lab-api:0.1.0
+    container_name: lab-api
+    depends_on: [minio, cache1, cache2, cache3]
+    environment:
+      <<: *s3-env
+      MOCACHE_NODES: http://cache1:8090,http://cache2:8090,http://cache3:8090
+      MOCACHE_PROTOCOL: ${MOCACHE_PROTOCOL:-http}   # http | grpc (unary RPC, :8091)
+      MOCACHE_TIMEOUT: ${MOCACHE_TIMEOUT:-1.0}
+      CACHE_TTL_SECONDS: ${CACHE_TTL_SECONDS:-300}
+      MAX_CACHEABLE_BYTES: ${MAX_CACHEABLE_BYTES:-393216}  # base64 keeps this under -max-value
+      THREAD_POOL_SIZE: ${THREAD_POOL_SIZE:-64}
+      API_WORKERS: ${API_WORKERS:-1}   # >1 shards the in-process /stats counters
+    ports: ["8000:8000"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/healthz',timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    networks: [lab]
+
+  # Load generator. Stdlib-only asyncio HTTP/1.1; run it, don't leave it up.
+  bench:
+    build:
+      context: .
+      dockerfile: bench/Dockerfile
+    image: mocache-lab-bench:0.1.0
+    container_name: lab-bench
+    profiles: [tools]
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      API_URL: http://api:8000
+      CACHE_METRICS: http://cache1:8090,http://cache2:8090,http://cache3:8090
+    # Write --json reports as the invoking user, not root.
+    user: "${LAB_UID:-1000}:${LAB_GID:-1000}"
+    volumes:
+      - ./results:/results
+    networks: [lab]
+
+  # Real Redis clients, unmodified, against the RESP port. Add --cluster /
+  # -cluster to exercise slot discovery and MOVED across all three nodes.
+  compat-py:
+    build:
+      context: ./compat
+      dockerfile: py/Dockerfile
+    image: mocache-compat-py:0.1.0
+    container_name: lab-compat-py
+    profiles: [tools]
+    depends_on: [cache1, cache2, cache3]
+    environment:
+      REDIS_HOST: cache1
+      REDIS_PORT: "6379"
+    networks: [lab]
+
+  compat-go:
+    build:
+      context: ./compat
+      dockerfile: go/Dockerfile
+    image: mocache-compat-go:0.1.0
+    container_name: lab-compat-go
+    profiles: [tools]
+    depends_on: [cache1, cache2, cache3]
+    environment:
+      REDIS_ADDR: cache1:6379
+      REDIS_ADDRS: cache1:6379,cache2:6379,cache3:6379
+    networks: [lab]
+
+  # Optional: docker compose --profile obs up -d prometheus  -> http://127.0.0.1:9090
+  prometheus:
+    image: quay.io/prometheus/prometheus:latest
+    container_name: lab-prometheus
+    profiles: [obs]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=2h
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports: ["9090:9090"]
+    networks: [lab]
+
+volumes:
+  minio-data:
+
+networks:
+  lab:
+    name: mocache-lab

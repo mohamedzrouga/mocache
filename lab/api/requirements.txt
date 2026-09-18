@@ -1,0 +1,5 @@
+# Lab-only dependencies. The cache node and both SDKs stay stdlib-only —
+# see AGENTS.md; nothing here is allowed to leak into cmd/, internal/ or sdk/.
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.30,<1.0
+boto3>=1.34,<2.0

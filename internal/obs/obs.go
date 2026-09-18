@@ -30,10 +30,39 @@ var (
 	histCount   atomic.Uint64
 	histSumNs   atomic.Uint64
 	histBuckets [11]atomic.Uint64
+
+	// RESP (Redis-protocol) front end.
+	respCmds  atomic.Uint64
+	respErrs  atomic.Uint64
+	respConns atomic.Int64
+	respMoved atomic.Uint64
+	respAsk   atomic.Uint64
+	respSumNs atomic.Uint64
+
+	// Replication, published on a timer by cmd/mocache.
+	replIsReplica atomic.Bool
+	replOffset    atomic.Uint64
+	replConnected atomic.Int64
+	replLinkUp    atomic.Bool
+	replResyncs   atomic.Uint64
+	replFailovers atomic.Uint64
+
+	// Cluster view, published on a timer by cmd/mocache.
+	clusterOn       atomic.Bool
+	clusterAssigned atomic.Int64
+	clusterKnown    atomic.Int64
+	clusterMySlots  atomic.Int64
 )
 
 // Prometheus histogram bounds in seconds.
 var buckets = [...]float64{0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1}
+
+func boolGauge(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
 
 // InitJSONLogs replaces the default logger with JSON on stdout (cluster-friendly).
 func InitJSONLogs() {
@@ -57,6 +86,50 @@ func RecordRequest(dur time.Duration, err bool) {
 }
 
 func InFlight(delta int64) { inflight.Add(delta) }
+
+// RecordRESP counts one Redis-protocol command. err marks an error reply —
+// including MOVED, which is an error frame on the wire but a normal event in a
+// cluster, so it is also counted separately by RecordMoved.
+func RecordRESP(dur time.Duration, err bool) {
+	respCmds.Add(1)
+	respSumNs.Add(uint64(dur.Nanoseconds()))
+	if err {
+		respErrs.Add(1)
+	}
+}
+
+// RecordMoved counts a slot redirect. A high rate means clients are routing on
+// a stale slot map — the first thing to look at after a topology change.
+func RecordMoved() { respMoved.Add(1) }
+
+// RecordAsk counts an ASK redirect, which means a key has already moved to the
+// slot's new home while the reshard is still running. Unlike MOVED it is
+// expected to be non-zero only while a reshard is in progress, and to stop when
+// it finishes — a steady rate afterwards means a migration was never committed
+// with CLUSTER SETSLOT NODE.
+func RecordAsk() { respAsk.Add(1) }
+
+// RESPConns tracks open Redis-protocol connections.
+func RESPConns(delta int64) { respConns.Add(delta) }
+
+// SetReplicationInfo publishes the live replication state for scraping. Called
+// on a timer because gossip and failover change it at runtime.
+func SetReplicationInfo(isReplica bool, offset uint64, replicas int, linkUp bool, resyncs, failovers uint64) {
+	replIsReplica.Store(isReplica)
+	replOffset.Store(offset)
+	replConnected.Store(int64(replicas))
+	replLinkUp.Store(linkUp)
+	replResyncs.Store(resyncs)
+	replFailovers.Store(failovers)
+}
+
+// SetClusterInfo publishes the static cluster view for scraping.
+func SetClusterInfo(enabled bool, assigned, known, mySlots int) {
+	clusterOn.Store(enabled)
+	clusterAssigned.Store(int64(assigned))
+	clusterKnown.Store(int64(known))
+	clusterMySlots.Store(int64(mySlots))
+}
 
 // WritePrometheus emits the Prometheus text exposition format (0.0.4).
 func WritePrometheus(w io.Writer, st cache.Stats) {
@@ -83,6 +156,22 @@ func WritePrometheus(w io.Writer, st cache.Stats) {
 	p("mocache_request_duration_seconds_bucket{le=\"+Inf\"} %d\n", histCount.Load())
 	p("mocache_request_duration_seconds_sum %s\n", strconv.FormatFloat(float64(histSumNs.Load())/1e9, 'f', 6, 64))
 	p("mocache_request_duration_seconds_count %d\n", histCount.Load())
+	p("# HELP mocache_resp_commands_total Redis-protocol commands handled.\n# TYPE mocache_resp_commands_total counter\nmocache_resp_commands_total %d\n", respCmds.Load())
+	p("# HELP mocache_resp_errors_total Redis-protocol error replies (including redirects).\n# TYPE mocache_resp_errors_total counter\nmocache_resp_errors_total %d\n", respErrs.Load())
+	p("# HELP mocache_resp_moved_total MOVED redirects sent; a rising rate means stale client slot maps.\n# TYPE mocache_resp_moved_total counter\nmocache_resp_moved_total %d\n", respMoved.Load())
+	p("# HELP mocache_resp_ask_total ASK redirects sent during a live slot migration.\n# TYPE mocache_resp_ask_total counter\nmocache_resp_ask_total %d\n", respAsk.Load())
+	p("# HELP mocache_resp_connections Open Redis-protocol connections.\n# TYPE mocache_resp_connections gauge\nmocache_resp_connections %d\n", respConns.Load())
+	p("# HELP mocache_resp_duration_seconds_sum Total time spent executing Redis-protocol commands.\n# TYPE mocache_resp_duration_seconds_sum counter\nmocache_resp_duration_seconds_sum %s\n", strconv.FormatFloat(float64(respSumNs.Load())/1e9, 'f', 6, 64))
+	p("# HELP mocache_cluster_enabled 1 when the node serves a slot range.\n# TYPE mocache_cluster_enabled gauge\nmocache_cluster_enabled %d\n", boolGauge(clusterOn.Load()))
+	p("# HELP mocache_cluster_slots_assigned Slots with an owner across the cluster (16384 = complete).\n# TYPE mocache_cluster_slots_assigned gauge\nmocache_cluster_slots_assigned %d\n", clusterAssigned.Load())
+	p("# HELP mocache_cluster_known_nodes Nodes in this node's cluster view.\n# TYPE mocache_cluster_known_nodes gauge\nmocache_cluster_known_nodes %d\n", clusterKnown.Load())
+	p("# HELP mocache_cluster_my_slots Slots served by this node.\n# TYPE mocache_cluster_my_slots gauge\nmocache_cluster_my_slots %d\n", clusterMySlots.Load())
+	p("# HELP mocache_repl_role 1 when this node is a replica, 0 when it is a primary.\n# TYPE mocache_repl_role gauge\nmocache_repl_role %d\n", boolGauge(replIsReplica.Load()))
+	p("# HELP mocache_repl_offset Replication offset: a primary's write position, or a replica's applied position.\n# TYPE mocache_repl_offset gauge\nmocache_repl_offset %d\n", replOffset.Load())
+	p("# HELP mocache_repl_connected_replicas Replicas currently streaming from this primary.\n# TYPE mocache_repl_connected_replicas gauge\nmocache_repl_connected_replicas %d\n", replConnected.Load())
+	p("# HELP mocache_repl_link_up 1 when a replica's link to its primary is in sync.\n# TYPE mocache_repl_link_up gauge\nmocache_repl_link_up %d\n", boolGauge(replLinkUp.Load()))
+	p("# HELP mocache_repl_full_resyncs_total Full resynchronisations this replica has performed.\n# TYPE mocache_repl_full_resyncs_total counter\nmocache_repl_full_resyncs_total %d\n", replResyncs.Load())
+	p("# HELP mocache_cluster_failovers_total Slot-ownership changes this node has applied.\n# TYPE mocache_cluster_failovers_total counter\nmocache_cluster_failovers_total %d\n", replFailovers.Load())
 	p("# HELP go_goroutines Number of goroutines.\n# TYPE go_goroutines gauge\ngo_goroutines %d\n", runtime.NumGoroutine())
 	p("# HELP go_memstats_alloc_bytes Bytes allocated and still in use.\n# TYPE go_memstats_alloc_bytes gauge\ngo_memstats_alloc_bytes %d\n", ms.Alloc)
 	p("# HELP go_memstats_sys_bytes Bytes obtained from the OS.\n# TYPE go_memstats_sys_bytes gauge\ngo_memstats_sys_bytes %d\n", ms.Sys)

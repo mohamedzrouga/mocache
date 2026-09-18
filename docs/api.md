@@ -2,6 +2,8 @@
 
 Base URL: `http://<pod-dns>:8090`
 
+This is one of three front ends over the same LRU: HTTP here, unary RPC in [protocol.md](protocol.md), and the Redis protocol in [redis.md](redis.md).
+
 | Method | Path | Request | Response |
 |---|---|---|---|
 | GET | `/get?key=` | — | **200** raw value bytes; **404** absent or expired |
