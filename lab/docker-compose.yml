@@ -71,6 +71,7 @@ services:
       - -cluster-peer=cache1:6379=0-5460,cache2:6379=5461-10922,cache3:6379=10923-16383,cache4:6379=replica-of:cache1:6379,cache5:6379=replica-of:cache2:6379,cache6:6379=replica-of:cache3:6379
       - -cluster-node-timeout=2s
       - -cluster-failover-delay=300ms
+      - -cluster-replica-migration=true
       - -capacity=20000
       - -max-bytes=33554432
       - -max-value=1048576
@@ -90,6 +91,7 @@ services:
       - -cluster-peer=cache1:6379=0-5460,cache2:6379=5461-10922,cache3:6379=10923-16383,cache4:6379=replica-of:cache1:6379,cache5:6379=replica-of:cache2:6379,cache6:6379=replica-of:cache3:6379
       - -cluster-node-timeout=2s
       - -cluster-failover-delay=300ms
+      - -cluster-replica-migration=true
       - -capacity=20000
       - -max-bytes=33554432
       - -max-value=1048576
@@ -109,6 +111,7 @@ services:
       - -cluster-peer=cache1:6379=0-5460,cache2:6379=5461-10922,cache3:6379=10923-16383,cache4:6379=replica-of:cache1:6379,cache5:6379=replica-of:cache2:6379,cache6:6379=replica-of:cache3:6379
       - -cluster-node-timeout=2s
       - -cluster-failover-delay=300ms
+      - -cluster-replica-migration=true
       - -capacity=20000
       - -max-bytes=33554432
       - -max-value=1048576
@@ -128,6 +131,7 @@ services:
       - -cluster-peer=cache1:6379=0-5460,cache2:6379=5461-10922,cache3:6379=10923-16383,cache4:6379=replica-of:cache1:6379,cache5:6379=replica-of:cache2:6379,cache6:6379=replica-of:cache3:6379
       - -cluster-node-timeout=2s
       - -cluster-failover-delay=300ms
+      - -cluster-replica-migration=true
       - -capacity=20000
       - -max-bytes=33554432
       - -max-value=1048576
@@ -147,6 +151,7 @@ services:
       - -cluster-peer=cache1:6379=0-5460,cache2:6379=5461-10922,cache3:6379=10923-16383,cache4:6379=replica-of:cache1:6379,cache5:6379=replica-of:cache2:6379,cache6:6379=replica-of:cache3:6379
       - -cluster-node-timeout=2s
       - -cluster-failover-delay=300ms
+      - -cluster-replica-migration=true
       - -capacity=20000
       - -max-bytes=33554432
       - -max-value=1048576
@@ -166,6 +171,7 @@ services:
       - -cluster-peer=cache1:6379=0-5460,cache2:6379=5461-10922,cache3:6379=10923-16383,cache4:6379=replica-of:cache1:6379,cache5:6379=replica-of:cache2:6379,cache6:6379=replica-of:cache3:6379
       - -cluster-node-timeout=2s
       - -cluster-failover-delay=300ms
+      - -cluster-replica-migration=true
       - -capacity=20000
       - -max-bytes=33554432
       - -max-value=1048576

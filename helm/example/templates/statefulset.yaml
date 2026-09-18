@@ -58,6 +58,7 @@ spec:
             {{- if .Values.resp.cluster.bus }}
             - -cluster-node-timeout={{ .Values.resp.cluster.nodeTimeout }}
             - -cluster-failover-delay={{ .Values.resp.cluster.failoverDelay }}
+            - -cluster-replica-migration={{ .Values.resp.cluster.replicaMigration }}
             - -repl-backlog-bytes={{ int64 .Values.resp.cluster.backlogBytes }}
             {{- else }}
             - -cluster-bus=false

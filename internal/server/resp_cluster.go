@@ -3,6 +3,7 @@ package server
 import (
 	"fmt"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -93,6 +94,16 @@ func cmdCluster(c *respConn, args [][]byte) bool {
 			return true
 		}
 		c.w.OK()
+
+	case "SETSLOT":
+		return cmdClusterSetSlot(c, args)
+
+	case "BUMPEPOCH":
+		if !t.Enabled() {
+			c.w.Error("ERR This instance has cluster support disabled")
+			return true
+		}
+		c.w.Simple("BUMPED " + strconv.FormatUint(c.s.mgr.BumpConfigEpoch(), 10))
 
 	case "REPLICATE":
 		if len(args) != 3 {
@@ -256,8 +267,15 @@ func clusterNodesText(c *respConn) string {
 
 func nodeLine(c *respConn, n *cluster.Node) string {
 	t := c.s.view()
+	self := n.ID == t.Myself().ID
 	flags := n.Role.String()
-	if n.ID == t.Myself().ID {
+	switch {
+	case n.Fail:
+		flags += ",fail"
+	case n.PFail:
+		flags += ",fail?"
+	}
+	if self {
 		flags = "myself," + flags
 	}
 	primary := "-"
@@ -271,10 +289,100 @@ func nodeLine(c *respConn, n *cluster.Node) string {
 		slots.WriteByte(' ')
 		slots.WriteString(r.String())
 	}
-	// ping-sent and pong-recv are 0 and link-state is "connected" because the
-	// view is static: there is no cluster bus measuring liveness yet.
-	return fmt.Sprintf("%s %s@%d %s %s 0 0 0 connected%s",
-		n.ID, n.Addr(), n.BusPort(), flags, primary, slots.String())
+	// Reshard markers belong only on the myself line: they are local state, and
+	// no other node knows about a migration it is not a party to. redis-cli
+	// --cluster reads them to find an interrupted reshard and offer to finish it.
+	if self {
+		writeReshardMarkers(&slots, t.MigratingSlots(), "->-")
+		writeReshardMarkers(&slots, t.ImportingSlots(), "-<-")
+	}
+	// ping-sent and pong-recv stay 0: the bus measures liveness as a boolean,
+	// and clients use the flags for that, not the timestamps.
+	link := "connected"
+	if !self && !n.LinkUp {
+		link = "disconnected"
+	}
+	return fmt.Sprintf("%s %s@%d %s %s 0 0 %d %s%s",
+		n.ID, n.Addr(), n.BusPort(), flags, primary, n.ConfigEpoch, link, slots.String())
+}
+
+func writeReshardMarkers(b *strings.Builder, slots map[int]string, arrow string) {
+	if len(slots) == 0 {
+		return
+	}
+	ordered := make([]int, 0, len(slots))
+	for slot := range slots {
+		ordered = append(ordered, slot)
+	}
+	sort.Ints(ordered)
+	for _, slot := range ordered {
+		fmt.Fprintf(b, " [%d%s%s]", slot, arrow, slots[slot])
+	}
+}
+
+// cmdClusterSetSlot implements the four forms of CLUSTER SETSLOT. Together they
+// are the whole of live resharding: MIGRATING and IMPORTING open the window in
+// which a slot's keys live on two nodes at once, NODE closes it by moving
+// ownership, and STABLE abandons it.
+func cmdClusterSetSlot(c *respConn, args [][]byte) bool {
+	t := c.s.view()
+	if !t.Enabled() {
+		c.w.Error("ERR This instance has cluster support disabled")
+		return true
+	}
+	if len(args) < 4 {
+		c.w.Error("ERR wrong number of arguments for 'cluster|setslot' command")
+		return true
+	}
+	slot, err := strconv.Atoi(string(args[2]))
+	if err != nil || slot < 0 || slot >= cluster.SlotCount {
+		c.w.Error("ERR Invalid or out of range slot")
+		return true
+	}
+
+	action := strings.ToUpper(string(args[3]))
+	if action == "STABLE" {
+		if len(args) != 4 {
+			c.w.Error("ERR wrong number of arguments for 'cluster|setslot' command")
+			return true
+		}
+		if err := c.s.mgr.SetSlotStable(slot); err != nil {
+			c.w.Errorf("ERR %v", err)
+			return true
+		}
+		c.w.OK()
+		return false
+	}
+	if len(args) != 5 {
+		c.w.Error("ERR wrong number of arguments for 'cluster|setslot' command")
+		return true
+	}
+	nodeID := string(args[4])
+
+	switch action {
+	case "MIGRATING":
+		err = c.s.mgr.SetSlotMigrating(slot, nodeID)
+	case "IMPORTING":
+		err = c.s.mgr.SetSlotImporting(slot, nodeID)
+	case "NODE":
+		// Giving a slot away while its keys are still here would strand them:
+		// invisible at the new owner, and unreachable here the moment the slot
+		// map changes. The reshard has to finish moving them first.
+		if nodeID != t.Myself().ID && t.Mine(slot) && len(keysInSlot(c, slot, 1)) > 0 {
+			c.w.Errorf("ERR Can't assign hashslot %d to a different node while I still hold keys for this hash slot.", slot)
+			return true
+		}
+		err = c.s.mgr.SetSlotOwner(slot, nodeID)
+	default:
+		c.w.Error("ERR Invalid CLUSTER SETSLOT action or number of arguments.")
+		return true
+	}
+	if err != nil {
+		c.w.Errorf("ERR %v", err)
+		return true
+	}
+	c.w.OK()
+	return false
 }
 
 func clusterInfoText(c *respConn) string {

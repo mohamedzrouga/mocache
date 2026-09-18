@@ -2,7 +2,7 @@
 
 MoCache uses **Redis Cluster's key routing**: the keyspace is 16384 slots, a key's slot is `CRC16(key) mod 16384` (or of its `{hash tag}`), and each node owns a range. Stock cluster clients already implement this, so `RedisCluster` and `ClusterClient` shard across MoCache nodes with no MoCache-specific code.
 
-> **Status.** Sharding, replication and automatic failover all work. Nodes gossip over a private cluster bus, primaries stream their mutations to replicas, and a replica is promoted by majority vote of the primaries when its primary dies. What is *not* built: live slot migration (resharding) and `ASK` redirects — see [Resharding](#resharding).
+> **Status.** Sharding, replication, automatic failover and live resharding all work. Nodes gossip over a private cluster bus, primaries stream their mutations to replicas, a replica is promoted by majority vote of the primaries when its primary dies, and slots move between live nodes without taking keys offline. What is *not* built: chained replication, and persistence — see [What is not built](#what-is-not-built).
 
 ## Configuring a cluster
 
@@ -42,6 +42,7 @@ Beyond the client port, each node listens on **client port + 10000** — the por
 | `-cluster-bus-addr` | *(derived)* | Override the bus listen address |
 | `-cluster-node-timeout` | `5s` | Peer silence before it is suspected; other timings derive from this |
 | `-cluster-failover-delay` | `500ms` | Base wait before a replica stands for election |
+| `-cluster-replica-migration` | `true` | Move a spare replica to a shard that has none |
 | `-repl-backlog-bytes` | `32Mi` | Backlog per primary; a replica further behind resynchronises |
 
 Setting `-cluster-bus=false` gives the earlier behaviour: sharding, but no replication and no failover.
@@ -74,6 +75,16 @@ Two properties do the real work. **One vote per epoch** stops two replicas of th
 Slot claims are also voided by gossip, not only by the promotion broadcast: a node that missed the broadcast still converges, instead of advertising a second owner for slots it no longer holds.
 
 **A promoted node that restarts takes its promotion back.** Nothing is written to disk, so it comes back with the role its `-cluster-peer` flags describe — a replica — while every other node still holds its promotion at a higher config epoch. It learns of it through gossip and resumes serving those slots at the epoch it was elected at, empty, refilling on misses. Without that, the cluster would redirect clients to a node that disowned the slots and sent them back, which no amount of waiting resolves.
+
+### Replica migration
+
+A shard with no replica cannot fail over, so it is one crash away from taking its slots offline until someone intervenes. When another shard has a spare, that spare moves to cover it:
+
+- Only a **spare** moves — a replica whose shard keeps at least one other healthy replica behind, so the move never creates the problem it is solving.
+- Every replica decides this locally from the same gossiped view, and the choice is deterministic (lowest node ID stays, the next one moves), so several spares cannot pile onto one orphan at once.
+- `-cluster-replica-migration=false` turns it off.
+
+The node it moves to is recorded by that node itself and travels in its gossip — a replica is the authority on which primary it follows, and every other node has to agree, or a voter would refuse to vote for it when its new primary dies.
 
 ### Manual failover
 
@@ -117,11 +128,65 @@ This is the sharp edge of the current design. A MoCache node can be reached thre
 
 Both reach the same LRU on the same process, and neither redirects the other's traffic. So a key written through the Go SDK and read through `redis-py` **may be on different nodes** and read as a miss.
 
-Pick one scheme per keyspace. Mixing is safe only on a single node, or if you keep separate key prefixes per access path. The intended direction is for the SDKs to move onto CRC16 slots so there is one scheme; until then, `docs/architecture.md` still describes the ring as the SDK's routing and that remains true.
+The SDKs can now be told to route by slots instead, which is what makes one keyspace safe to share:
+
+```go
+mocache.New(nodes, mocache.WithSlots(map[string]string{
+    "http://cache-0:8090": "0-5460",
+    "http://cache-1:8090": "5461-10922",
+    "http://cache-2:8090": "10923-16383",
+}))
+```
+
+```python
+MoCacheClient(nodes, slots={"http://cache-0:8090": "0-5460", ...})
+```
+
+The ranges are the ones each node's `-cluster-peer` entry declares, and they must cover all 16384 slots exactly once — a gap or an overlap is refused at construction rather than silently misrouting.
+
+The ring stays the default, so upgrading does not move an existing deployment's keys. Two limits are worth being explicit about: the slot map is **static**, so it does not follow a failover or a reshard — after either, the affected slots are served by a node the map does not name, and the SDK misses on them until it is updated. The ring has always had the same limitation, since neither knows anything about cluster membership. A client that must track topology changes should use the RESP port with a real cluster client, which follows `MOVED`.
+
+`docs/architecture.md` describes the ring, which remains what the SDK does unless you configure slots.
 
 ## Resharding
 
-There is none yet. Changing the slot map means changing `-cluster-peer` on every node and restarting them; keys that move are simply lost (they were cache entries). Live migration needs `CLUSTER SETSLOT` with `MIGRATING`/`IMPORTING`, the `MIGRATE` command and `-ASK` redirects — listed below.
+Slots move between live nodes without taking keys offline, using the same commands and the same redirects Redis uses — so `redis-cli --cluster reshard` drives it, and stock cluster clients follow it without noticing.
+
+Moving a slot cannot be atomic: its keys are copied one at a time while clients keep reading and writing. Two per-slot markers close that window.
+
+| Marker | Where | Effect |
+|---|---|---|
+| `MIGRATING <dest>` | the current owner | a key that is still here is served here; a key that is gone gets `-ASK <slot> <dest>` |
+| `IMPORTING <src>` | the destination | serves the slot only for a connection that sent `ASKING`; everyone else gets `-MOVED` back to the source |
+
+Together they mean a key is always served by exactly one of the two nodes, and the client is told which one without being told the slot has moved. Ownership changes only at the final step.
+
+```
+# 1. Open the window — on the destination first, so no key is ever unreachable.
+redis-cli -p 7002 CLUSTER SETSLOT 866 IMPORTING <source-node-id>
+redis-cli -p 7001 CLUSTER SETSLOT 866 MIGRATING <dest-node-id>
+
+# 2. Move the keys, in batches.
+redis-cli -p 7001 CLUSTER GETKEYSINSLOT 866 100
+redis-cli -p 7001 MIGRATE 127.0.0.1 7002 "" 0 5000 KEYS key1 key2 ...
+
+# 3. Commit, on both nodes and on every other primary.
+redis-cli -p 7002 CLUSTER SETSLOT 866 NODE <dest-node-id>
+redis-cli -p 7001 CLUSTER SETSLOT 866 NODE <dest-node-id>
+```
+
+`CLUSTER SETSLOT <slot> STABLE` abandons a migration and leaves ownership where it is.
+
+Things worth knowing:
+
+- **`MIGRATE` moves data over the cluster bus**, not over the destination's client port. The command's arguments are Redis's, because that is what tooling sends; the wire format between the two nodes is ours, and the destination's client port is never used. The whole batch is one frame and one round trip, so it either all arrives or none of it does.
+- **Keys arrive with their absolute expiry**, not a restarted TTL — the same rule replication follows.
+- **A missing key is not an error.** `MIGRATE` skips keys that are gone and answers `+NOKEY` if none were found: in a cache an entry can expire or be evicted between the `GETKEYSINSLOT` that listed it and the `MIGRATE` that moves it.
+- **Committing is refused while the source still holds keys in the slot.** They would be invisible at the new owner and unreachable at the old one.
+- **Only the destination raises a config epoch.** That is the one new claim, and it reaches every other node by gossip exactly as a failover does — so a node that was never sent `SETSLOT NODE` still converges.
+- **An abandoned reshard leaves no trace.** The markers are local to the two nodes and carry no config epoch; nothing else in the cluster ever learns about a move that was not committed.
+- **Drive a reshard from one place.** Two running at once can draw the same config epoch. Redis has the same property and the same answer.
+- Watch `mocache_resp_ask_total`: it should be non-zero only while a reshard is running.
 
 ## Operating it
 
@@ -153,7 +218,6 @@ What that still does **not** cover: the bus framing and the replication stream u
 
 ## What is not built
 
-- **Live slot migration.** `CLUSTER SETSLOT` with `MIGRATING`/`IMPORTING`, the `MIGRATE` command, and `-ASK` redirects (plus `ASKING`). Until then, changing the slot map means changing `-cluster-peer` everywhere and restarting; keys that move are lost.
 - **Chained replication.** A replica will not serve as another replica's primary; it answers such a subscription with an error rather than handing out offsets it cannot honour.
-- **Replica migration.** Redis moves a spare replica to a shard that has none. Here, a shard whose only replica is gone stays exposed until someone runs `CLUSTER REPLICATE`.
+- **Automatic rebalancing.** Slots move on demand, but nothing decides *when* they should: there is no equivalent of `redis-cli --cluster rebalance` choosing a plan. Resharding is an operator action.
 - **Persistence.** Unchanged and deliberate: a restarted node comes back empty and refills from its primary. Replication buys availability, not durability.

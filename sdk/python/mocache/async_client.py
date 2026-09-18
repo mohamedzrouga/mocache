@@ -20,9 +20,12 @@ class AsyncMoCacheClient:
         timeout: float = 1.0,
         protocol: str = "http",
         rpc_port: int = 8091,
+        slots: dict[str, str] | None = None,
     ) -> None:
         # One sync client under the hood; to_thread keeps the event loop free.
-        self._sync = MoCacheClient(nodes, vnodes=vnodes, timeout=timeout, protocol=protocol, rpc_port=rpc_port)
+        self._sync = MoCacheClient(
+            nodes, vnodes=vnodes, timeout=timeout, protocol=protocol, rpc_port=rpc_port, slots=slots
+        )
 
     async def get(self, key: str) -> str | None:
         return await asyncio.to_thread(self._sync.get, key)

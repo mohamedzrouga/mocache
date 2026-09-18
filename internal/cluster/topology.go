@@ -98,6 +98,53 @@ type Topology struct {
 	byID    map[string]*Node
 	owner   [SlotCount]*Node
 	enabled bool
+
+	// Reshard state for slots this node is a party to. Nil on a node not
+	// resharding, which is the common case.
+	migrating map[int]string // slot -> destination node ID
+	importing map[int]string // slot -> source node ID
+}
+
+// Migrating returns the node ID a slot is leaving this node for, or "" when it
+// is not being migrated away. While a slot is migrating, keys that are still
+// here are served here and keys that are gone are answered with ASK.
+func (t *Topology) Migrating(slot int) string {
+	if t == nil || t.migrating == nil {
+		return ""
+	}
+	return t.migrating[slot]
+}
+
+// Importing returns the node ID a slot is arriving from, or "" when it is not
+// being imported. While a slot is importing, this node serves it only for
+// clients that sent ASKING; everyone else is sent back to the current owner.
+func (t *Topology) Importing(slot int) string {
+	if t == nil || t.importing == nil {
+		return ""
+	}
+	return t.importing[slot]
+}
+
+// Resharding reports whether any slot here is mid-migration, which CLUSTER INFO
+// and the reshard-safety checks need to know.
+func (t *Topology) Resharding() bool {
+	return t != nil && (len(t.migrating) > 0 || len(t.importing) > 0)
+}
+
+// MigratingSlots and ImportingSlots are the per-slot markers CLUSTER NODES
+// renders as [slot->-nodeid] and [slot-<-nodeid].
+func (t *Topology) MigratingSlots() map[int]string {
+	if t == nil {
+		return nil
+	}
+	return t.migrating
+}
+
+func (t *Topology) ImportingSlots() map[int]string {
+	if t == nil {
+		return nil
+	}
+	return t.importing
 }
 
 // Disabled is the standalone view: no slots, no redirects, CLUSTER INFO reports

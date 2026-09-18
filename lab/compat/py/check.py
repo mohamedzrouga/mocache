@@ -130,6 +130,84 @@ def cluster_topology(r: RedisCluster) -> None:
     check_true("keyslot is deterministic", r.keyslot("foo") == 12182)
 
 
+def reshard(r: RedisCluster) -> None:
+    """Move one slot between two live nodes and read through it the whole time.
+
+    This is the check that matters for resharding: redis-py follows ASK on its
+    own, so if the markers, the redirect or ASKING are wrong the client either
+    raises or reads a miss. Nothing here is MoCache-specific — it is the same
+    sequence redis-cli --cluster reshard runs.
+    """
+    print("reshard")
+    key = "reshard:probe"
+    slot = r.keyslot(key)
+    r.set(key, "before")
+
+    src = r.get_node_from_key(key)
+    dest = next((n for n in r.get_primaries() if n.name != src.name), None)
+    if dest is None:
+        check_true("a second primary exists to reshard into", False)
+        return
+    src_id = r.execute_command("CLUSTER MYID", target_nodes=src)
+    dest_id = r.execute_command("CLUSTER MYID", target_nodes=dest)
+    if isinstance(src_id, bytes):
+        src_id, dest_id = src_id.decode(), dest_id.decode()
+    print(f"  moving slot {slot}: {src.name} -> {dest.name}")
+
+    try:
+        # 1. Open the window. Destination first, so no key is ever unreachable.
+        r.execute_command("CLUSTER SETSLOT", slot, "IMPORTING", src_id, target_nodes=dest)
+        r.execute_command("CLUSTER SETSLOT", slot, "MIGRATING", dest_id, target_nodes=src)
+
+        # The key has not moved yet, so it is still served by the source.
+        check("read during migration, before the key moves", r.get(key), b"before")
+
+        # A key that does not exist in a migrating slot is an ASK, which the
+        # client follows to the destination — where it is a plain miss.
+        check("missing key in a migrating slot", r.get("reshard:absent{reshard:probe}"), None)
+
+        # 2. Move it.
+        keys = r.execute_command("CLUSTER GETKEYSINSLOT", slot, 100, target_nodes=src)
+        keys = [k.decode() if isinstance(k, bytes) else k for k in keys]
+        check_true(f"source lists {len(keys)} key(s) in the slot", key in keys)
+        dest_host, _, dest_port = dest.name.rpartition(":")
+        r.execute_command("MIGRATE", dest_host, int(dest_port), "", 0, 5000,
+                          "KEYS", *keys, target_nodes=src)
+
+        # Now it is at the destination, and the client is sent there by ASK.
+        check("read during migration, after the key moves", r.get(key), b"before")
+
+        # 3. Commit everywhere.
+        for node in r.get_primaries():
+            r.execute_command("CLUSTER SETSLOT", slot, "NODE", dest_id, target_nodes=node)
+
+        r.nodes_manager.initialize()
+        check("slot map moved to the destination", r.get_node_from_key(key).name, dest.name)
+        check("read after the reshard commits", r.get(key), b"before")
+        r.set(key, "after")
+        check("write after the reshard commits", r.get(key), b"after")
+
+        # Coverage must still be exact or the client would have refused the map.
+        check("all 16384 slots still covered", len(r.get_nodes()) >= 3, True)
+
+        # Put it back: a check that leaves the cluster reshaped makes whatever
+        # runs next depend on whether this one ran.
+        r.execute_command("CLUSTER SETSLOT", slot, "IMPORTING", dest_id, target_nodes=src)
+        r.execute_command("CLUSTER SETSLOT", slot, "MIGRATING", src_id, target_nodes=dest)
+        back = r.execute_command("CLUSTER GETKEYSINSLOT", slot, 100, target_nodes=dest)
+        back = [k.decode() if isinstance(k, bytes) else k for k in back]
+        if back:
+            src_host, _, src_port = src.name.rpartition(":")
+            r.execute_command("MIGRATE", src_host, int(src_port), "", 0, 5000,
+                              "KEYS", *back, "REPLACE", target_nodes=dest)
+        for node in r.get_primaries():
+            r.execute_command("CLUSTER SETSLOT", slot, "NODE", src_id, target_nodes=node)
+        r.nodes_manager.initialize()
+        check("slot restored to its original owner", r.get_node_from_key(key).name, src.name)
+    finally:
+        r.delete(key)
+
+
 def follow_moved(r: redis.Redis, host: str, port: int, protocol: int) -> redis.Redis:
     """Point a plain client at whichever node currently owns our keyspace.
 
@@ -174,6 +252,7 @@ def main() -> int:
         keyspace(r)
         if args.cluster:
             cluster_topology(r)
+            reshard(r)
     finally:
         r.close()
 

@@ -42,6 +42,7 @@ const (
 	TypeReplOp      Type = 12 // one live mutation
 	TypeAck         Type = 13 // generic acknowledgement
 	TypeError       Type = 14 // request refused, Header carries {"error": "..."}
+	TypeMigrate     Type = 15 // MIGRATE: keys handed to the node importing their slot
 )
 
 // MaxFrame bounds one frame so a peer cannot make us allocate without limit.

@@ -38,6 +38,13 @@ type Manager struct {
 	// timestamp compared against another node's, so nodes may disagree about
 	// what time it is without disagreeing about who is alive.
 	clock func() time.Time
+
+	// migrating and importing are the two halves of a live reshard, held per
+	// slot exactly as Redis holds them: local to the two nodes involved and
+	// never gossiped. Only the final SETSLOT NODE travels, as a raised config
+	// epoch, so a reshard abandoned halfway leaves no trace anywhere else.
+	migrating map[int]string // slot -> destination node ID
+	importing map[int]string // slot -> source node ID
 }
 
 type liveNode struct {
@@ -67,7 +74,10 @@ func NewManager(peers []string, announce string) (*Manager, error) {
 	if err != nil {
 		return nil, err
 	}
-	m := &Manager{me: topo.Myself().ID, nodes: make(map[string]*liveNode), enabled: true, clock: time.Now}
+	m := &Manager{
+		me: topo.Myself().ID, nodes: make(map[string]*liveNode), enabled: true, clock: time.Now,
+		migrating: make(map[int]string), importing: make(map[int]string),
+	}
 	now := m.clock()
 	for _, n := range topo.Nodes() {
 		m.nodes[n.ID] = &liveNode{
@@ -82,7 +92,10 @@ func NewManager(peers []string, announce string) (*Manager, error) {
 
 // StandaloneManager is the non-cluster view: one node, every slot, no bus.
 func StandaloneManager(host string, port int) *Manager {
-	m := &Manager{me: NodeID(joinHostPort(host, port)), nodes: make(map[string]*liveNode), clock: time.Now}
+	m := &Manager{
+		me: NodeID(joinHostPort(host, port)), nodes: make(map[string]*liveNode), clock: time.Now,
+		migrating: make(map[int]string), importing: make(map[int]string),
+	}
 	m.nodes[m.me] = &liveNode{
 		id: m.me, host: host, port: port, lastPong: m.clock(),
 		reports: make(map[string]time.Time),
@@ -140,6 +153,18 @@ func (m *Manager) rebuildLocked() {
 			for s := r.Start; s <= r.End; s++ {
 				t.owner[s] = n
 			}
+		}
+	}
+	// The snapshot owns its own copy: readers hold a *Topology for the length
+	// of a command and must not see a reshard change under them.
+	if len(m.migrating) > 0 || len(m.importing) > 0 {
+		t.migrating = make(map[int]string, len(m.migrating))
+		t.importing = make(map[int]string, len(m.importing))
+		for k, v := range m.migrating {
+			t.migrating[k] = v
+		}
+		for k, v := range m.importing {
+			t.importing[k] = v
 		}
 	}
 	m.view.Store(t)
@@ -260,6 +285,20 @@ func (m *Manager) MergeGossip(from string, epoch uint64, nodes []GossipNode) {
 				changed = true
 			}
 		}
+		// Which primary a replica follows carries no config epoch, so it cannot
+		// travel by the rule above — yet it has to travel, or a voter would
+		// refuse to vote for a candidate whose primary it still thinks is
+		// someone else. A node is the authority on the primary it chose, so
+		// only its own word counts; a relayed copy could be third-hand and
+		// stale. Restricting this to a node we already credit with no slots is
+		// what keeps it from undoing a promotion the node itself has forgotten
+		// — see adoptSelfClaimLocked for the other half of that case.
+		if from == g.ID && Role(g.Role) == RoleReplica && len(g.Slots) == 0 &&
+			len(n.slots) == 0 && n.primaryAddr != g.PrimaryAddr {
+			n.role = RoleReplica
+			n.primaryAddr = g.PrimaryAddr
+			changed = true
+		}
 		if g.ReplOffset > n.replOffset {
 			n.replOffset = g.ReplOffset
 		}
@@ -292,16 +331,24 @@ func (m *Manager) MergeGossip(from string, epoch uint64, nodes []GossipNode) {
 // any node left with nothing to a replica of the new owner.
 func (m *Manager) claimSlotsLocked(owner *liveNode) bool {
 	changed := false
+	claimed := setOf(owner.slots)
 	for _, n := range m.nodes {
 		if n.id == owner.id || len(n.slots) == 0 || n.configEpoch >= owner.configEpoch {
 			continue
 		}
-		if !slotsOverlap(n.slots, owner.slots) {
+		held := setOf(n.slots)
+		if !held.intersects(claimed) {
 			continue
 		}
-		n.slots = nil
-		n.role = RoleReplica
-		n.primaryAddr = owner.addr()
+		held.sub(claimed)
+		n.slots = held.ranges()
+		// Only a node left with nothing becomes a replica. A failover moves a
+		// whole shard and lands here; a reshard moves one slot, and the node
+		// that gave it up must keep serving the rest of its keyspace.
+		if len(n.slots) == 0 {
+			n.role = RoleReplica
+			n.primaryAddr = owner.addr()
+		}
 		changed = true
 	}
 	return changed
@@ -356,42 +403,39 @@ func (m *Manager) checkSelfDemotionLocked() bool {
 	if me == nil || me.role != RolePrimary || len(me.slots) == 0 {
 		return false
 	}
-	// Follow the highest overlapping claim, not the first one found: if several
-	// nodes claim our slots above our epoch, only the highest survives the same
-	// rule everywhere else, and following a lower one would mean replicating
+	// Give up exactly the slots someone else holds at a higher epoch — a
+	// reshard takes one, a failover takes them all — and follow the highest
+	// claimant, not the first one found: only the highest survives the same
+	// rule everywhere else, so following a lower one would mean replicating
 	// from a node that is itself about to stand down.
+	mine := setOf(me.slots)
 	var winner *liveNode
+	lost := false
 	for _, n := range m.nodes {
-		if n.id == m.me || n.role != RolePrimary || n.configEpoch <= me.configEpoch {
+		if n.id == m.me || n.role != RolePrimary || n.configEpoch <= me.configEpoch || len(n.slots) == 0 {
 			continue
 		}
-		if !slotsOverlap(n.slots, me.slots) {
+		theirs := setOf(n.slots)
+		if !mine.intersects(theirs) {
 			continue
 		}
+		mine.sub(theirs)
+		lost = true
 		if winner == nil || n.configEpoch > winner.configEpoch ||
 			(n.configEpoch == winner.configEpoch && n.id < winner.id) {
 			winner = n
 		}
 	}
-	if winner == nil {
+	if !lost {
 		return false
 	}
-	me.role = RoleReplica
-	me.slots = nil
-	me.primaryAddr = winner.addr()
-	me.configEpoch = 0
-	return true
-}
-
-func slotsOverlap(a, b []SlotRange) bool {
-	for _, x := range a {
-		for _, y := range b {
-			if x.Start <= y.End && y.Start <= x.End {
-				return true
-			}
-		}
+	me.slots = mine.ranges()
+	if len(me.slots) == 0 {
+		me.role = RoleReplica
+		me.primaryAddr = winner.addr()
+		me.configEpoch = 0
 	}
-	return false
+	return true
 }
 
 // ShouldFail reports whether enough primaries suspect a node for us to declare
@@ -636,14 +680,22 @@ func (m *Manager) PrimaryBusAddr() string {
 	return p.BusAddr()
 }
 
-// Demote turns this node into a replica of another, used when a returning
-// primary discovers it has been replaced.
+// Demote makes this node a replica of another: a returning primary that has
+// been replaced, an operator running CLUSTER REPLICATE, or a spare moving to
+// cover an orphaned shard.
+//
+// A node that already replicates something may be re-pointed — that is what
+// replica migration is — but a node that still owns slots may not, because
+// giving them up silently would strand that part of the keyspace.
 func (m *Manager) Demote(primaryID string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	me, p := m.nodes[m.me], m.nodes[primaryID]
-	if me == nil || p == nil || me.role == RoleReplica {
+	if me == nil || p == nil || p.id == m.me || len(me.slots) > 0 {
 		return false
+	}
+	if me.role == RoleReplica && me.primaryAddr == p.addr() {
+		return true // already following it; CLUSTER REPLICATE is idempotent
 	}
 	me.role = RoleReplica
 	me.slots = nil

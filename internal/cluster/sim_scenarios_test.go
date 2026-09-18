@@ -302,3 +302,103 @@ func TestSimPromotedReplicaSurvivesItsOwnRestart(t *testing.T) {
 		}
 	}
 }
+
+// A slot changes hands while the network drops, delays and reorders messages
+// and the clocks disagree. Ownership moves by config epoch, the same mechanism
+// a failover uses, but a reshard is finer grained: it must move exactly one
+// slot and leave the source serving the rest of its shard.
+func TestSimReshardUnderLossyNetwork(t *testing.T) {
+	const slot = 6000 // inside .2's range
+	for seed := int64(0); seed < seeds(20); seed++ {
+		s := newSim(t, seed, simOptions{
+			minLatency: time.Millisecond,
+			maxLatency: 600 * time.Millisecond,
+			loss:       0.10,
+			maxSkew:    3 * time.Second,
+		})
+		s.at(2*time.Second, func() { s.reshard(slot, "10.0.0.2:6379", "10.0.0.3:6379") })
+		s.at(7*time.Second, func() { s.commitReshard(slot, "10.0.0.2:6379", "10.0.0.3:6379") })
+		s.runUntilStable(120 * time.Second)
+		if s.failed {
+			continue
+		}
+		if len(s.promos) != 0 {
+			s.fail("a reshard triggered a failover: %v", s.promos)
+			continue
+		}
+		if owner := s.ownerOf(slot); owner != "10.0.0.3" {
+			s.fail("slot %d owned by %s after the reshard", slot, owner)
+			continue
+		}
+		src := s.byID["10.0.0.2:6379"].mgr.View().Myself()
+		if src.Role != RolePrimary {
+			s.fail("source was demoted by a one-slot reshard: %s", src.Role)
+			continue
+		}
+		if src.SlotsCount() != 5461 || src.OwnsSlot(slot) {
+			s.fail("source holds %d slots (still claims %d: %v), want 5461 and false",
+				src.SlotsCount(), slot, src.OwnsSlot(slot))
+		}
+	}
+}
+
+// The same move, but while another shard is partitioned away and failing over
+// around it. Which node ends up serving the slot is then not fixed — the shard
+// that received it may itself be promoted out from under the reshard — so what
+// is asserted is what must hold regardless: the slot stays with the shard it
+// was moved to, every node agrees, and the advertised coverage is still exact.
+// The per-event safety invariants do the rest.
+func TestSimReshardDuringFailover(t *testing.T) {
+	const slot = 6000
+	shard := map[string]bool{"10.0.0.3": true, "10.0.0.6": true} // .3 and its replica
+	for seed := int64(0); seed < seeds(20); seed++ {
+		s := newSim(t, seed, simOptions{
+			minLatency: time.Millisecond,
+			maxLatency: 600 * time.Millisecond,
+			loss:       0.10,
+			maxSkew:    3 * time.Second,
+		})
+		s.at(2*time.Second, func() { s.partition([]string{"10.0.0.1:6379", "10.0.0.4:6379"}) })
+		s.at(4*time.Second, func() { s.reshard(slot, "10.0.0.2:6379", "10.0.0.3:6379") })
+		s.at(9*time.Second, func() { s.commitReshard(slot, "10.0.0.2:6379", "10.0.0.3:6379") })
+		s.at(20*time.Second, func() { s.heal() })
+		s.runUntilStable(240 * time.Second)
+		if s.failed {
+			continue
+		}
+		if owner := s.ownerOf(slot); !shard[owner] {
+			s.fail("slot %d ended up at %s, outside the shard it was moved to", slot, owner)
+		}
+	}
+}
+
+// A reshard that is never committed must leave nothing behind. The markers are
+// local to the two nodes and carry no config epoch, so an abandoned move has to
+// be invisible to everyone else and clearable with SETSLOT STABLE.
+func TestSimAbandonedReshardLeavesNoTrace(t *testing.T) {
+	const slot = 6000
+	for seed := int64(0); seed < seeds(8); seed++ {
+		s := newSim(t, seed, simOptions{loss: 0.05})
+		s.at(2*time.Second, func() { s.reshard(slot, "10.0.0.2:6379", "10.0.0.3:6379") })
+		s.at(10*time.Second, func() {
+			for _, addr := range []string{"10.0.0.2:6379", "10.0.0.3:6379"} {
+				if err := s.byID[addr].mgr.SetSlotStable(slot); err != nil {
+					s.fail("SETSLOT STABLE: %v", err)
+				}
+			}
+		})
+		s.runUntilStable(90 * time.Second)
+		if s.failed {
+			continue
+		}
+		if owner := s.ownerOf(slot); owner != "10.0.0.2" {
+			s.fail("an abandoned reshard moved slot %d to %s", slot, owner)
+		}
+		for _, n := range s.nodes {
+			v := n.mgr.View()
+			if v.Resharding() {
+				s.fail("%s still carries reshard state after STABLE", n.short())
+			}
+		}
+	}
+}

@@ -43,6 +43,12 @@ type Options struct {
 	ReplBacklogBytes int64
 	// DialTimeout bounds one bus round trip.
 	DialTimeout time.Duration
+	// ReplicaMigration lets a spare replica move to a shard that has none, so
+	// one crash does not leave a shard unable to fail over. Redis calls this
+	// replica migration; -cluster-replica-migration turns it on by default, and
+	// it stays off for an embedder that did not ask for topology to change
+	// under it.
+	ReplicaMigration bool
 }
 
 func (o *Options) setDefaults() {
@@ -188,6 +194,7 @@ func (c *Cluster) loop() {
 			c.detectFailures()
 			c.reconcileRole()
 			c.maybeFailover()
+			c.maybeMigrateReplica()
 		}
 	}
 }

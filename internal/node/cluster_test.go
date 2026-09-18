@@ -63,6 +63,13 @@ func testOptions() Options {
 
 // startCluster builds nodes from peer specs and starts every one of them.
 func startCluster(t *testing.T, names []string, specs []string, addrs map[string]string) map[string]*testNode {
+	return startClusterWith(t, names, specs, addrs, nil)
+}
+
+// startClusterWith is startCluster with a hook to vary one option, so a test
+// that needs a non-default (replica migration, say) does not have to duplicate
+// the whole harness.
+func startClusterWith(t *testing.T, names []string, specs []string, addrs map[string]string, tune func(*Options)) map[string]*testNode {
 	t.Helper()
 	nodes := make(map[string]*testNode, len(names))
 	for _, name := range names {
@@ -73,6 +80,9 @@ func startCluster(t *testing.T, names []string, specs []string, addrs map[string
 		}
 		opt := testOptions()
 		opt.BusAddr = busAddrOf(hostOf(addrs[name]), portOf(addrs[name]))
+		if tune != nil {
+			tune(&opt)
+		}
 		cl := New(mgr, store, opt)
 		if err := cl.Start(); err != nil {
 			t.Fatalf("%s: start: %v", name, err)

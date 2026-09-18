@@ -45,9 +45,46 @@ func WithRPCPort(port int) Option {
 	return func(c *Client) { c.rpcPort = port }
 }
 
+// WithSlots routes by Redis Cluster slots instead of the MD5 hash ring, so a
+// key lands on the same node whether it is written through this SDK or through
+// a Redis client on the RESP port. The map is node URL to the slot list that
+// node's -cluster-peer entry declares:
+//
+//	mocache.WithSlots(map[string]string{
+//		"http://cache-0:8090": "0-5460",
+//		"http://cache-1:8090": "5461-10922",
+//		"http://cache-2:8090": "10923-16383",
+//	})
+//
+// The ranges must cover all 16384 slots exactly once. A bad map is reported by
+// every operation rather than at New, which has no error to return; see
+// slots.go for what this scheme does and does not track.
+func WithSlots(slots map[string]string) Option {
+	return func(c *Client) {
+		parsed := make(map[string][]SlotRange, len(slots))
+		for node, spec := range slots {
+			ranges, err := ParseSlotRanges(spec)
+			if err != nil {
+				c.routeErr = err
+				return
+			}
+			parsed[node] = ranges
+		}
+		c.slots = parsed
+	}
+}
+
+// router maps a key to the node that should hold it. The ring and the slot map
+// are the two implementations; both are immutable, so lookups need no lock.
+type router interface {
+	node(key string) string
+}
+
 type Client struct {
 	nodes    []string
-	ring     *hashRing
+	route    router
+	slots    map[string][]SlotRange
+	routeErr error
 	timeout  time.Duration
 	vnodes   int
 	protocol Protocol
@@ -67,7 +104,19 @@ func New(nodes []string, opts ...Option) *Client {
 	if c.vnodes < 1 {
 		c.vnodes = 100
 	}
-	c.ring = newHashRing(c.nodes, c.vnodes)
+	switch {
+	case c.routeErr != nil:
+		// Keep the parse error; every operation returns it.
+	case len(c.slots) > 0:
+		r, err := newSlotRouter(c.slots)
+		if err != nil {
+			c.routeErr = err
+		} else {
+			c.route = r
+		}
+	default:
+		c.route = newHashRing(c.nodes, c.vnodes)
+	}
 	if c.protocol == ProtocolGRPC {
 		c.tr = newRPCTransport(c.nodes, c.rpcPort, c.timeout)
 	} else {
@@ -80,6 +129,16 @@ func New(nodes []string, opts ...Option) *Client {
 		}}
 	}
 	return c
+}
+
+// routerErr reports a slot map that could not be used. Every key-routed
+// operation returns it, because New has no error to return and routing to the
+// wrong node silently is worse than failing loudly.
+func (c *Client) routerErr(op, key string) error {
+	if c.routeErr != nil {
+		return wrapErr(op, "", key, c.routeErr)
+	}
+	return nil
 }
 
 func (c *Client) opCtx(ctx context.Context) (context.Context, context.CancelFunc) {
@@ -100,9 +159,12 @@ func (c *Client) SetContext(ctx context.Context, key string, value []byte, ttl t
 	if c.closed.Load() {
 		return wrapErr("Set", "", key, errClosed)
 	}
+	if err := c.routerErr("Set", key); err != nil {
+		return err
+	}
 	ctx, cancel := c.opCtx(ctx)
 	defer cancel()
-	return c.tr.Set(ctx, c.ring.node(key), key, value, ttl)
+	return c.tr.Set(ctx, c.route.node(key), key, value, ttl)
 }
 
 func (c *Client) Get(key string) ([]byte, bool, error) {
@@ -113,9 +175,12 @@ func (c *Client) GetContext(ctx context.Context, key string) ([]byte, bool, erro
 	if c.closed.Load() {
 		return nil, false, wrapErr("Get", "", key, errClosed)
 	}
+	if err := c.routerErr("Get", key); err != nil {
+		return nil, false, err
+	}
 	ctx, cancel := c.opCtx(ctx)
 	defer cancel()
-	return c.tr.Get(ctx, c.ring.node(key), key)
+	return c.tr.Get(ctx, c.route.node(key), key)
 }
 
 func (c *Client) Delete(key string) error {
@@ -126,9 +191,12 @@ func (c *Client) DeleteContext(ctx context.Context, key string) error {
 	if c.closed.Load() {
 		return wrapErr("Delete", "", key, errClosed)
 	}
+	if err := c.routerErr("Delete", key); err != nil {
+		return err
+	}
 	ctx, cancel := c.opCtx(ctx)
 	defer cancel()
-	return c.tr.Delete(ctx, c.ring.node(key), key)
+	return c.tr.Delete(ctx, c.route.node(key), key)
 }
 
 // InvalidatePrefix deletes keys starting with prefix on every node.

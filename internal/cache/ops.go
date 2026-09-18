@@ -385,3 +385,40 @@ func (c *Cache) RandomKey() (string, bool) {
 	}
 	return "", false
 }
+
+// Export returns a key's value and absolute expiry without counting a hit.
+//
+// MIGRATE needs both under one lock: read separately, a key could be rewritten
+// or expire between the value and its TTL, and it would arrive at its new node
+// with a lifetime it never had.
+func (c *Cache) Export(key string) (value []byte, expireAt time.Time, ok bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e := c.liveLocked(key)
+	if e == nil {
+		return nil, time.Time{}, false
+	}
+	v := make([]byte, len(e.value))
+	copy(v, e.value)
+	return v, e.expireAt, true
+}
+
+// SetAt writes a value with an absolute expiry, as Set does with a relative
+// one. It is how a migrated key lands on its new node: converting to a TTL on
+// the way in would restart the clock, and the key would outlive the copy it
+// replaced by the length of the migration.
+func (c *Cache) SetAt(key string, value []byte, expireAt time.Time) error {
+	if len(key) > c.maxKey || len(value) > c.maxValue {
+		return ErrTooLarge
+	}
+	if costOf(key, value) > c.maxBytes {
+		return ErrTooLarge
+	}
+	v := make([]byte, len(value))
+	copy(v, value)
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.setLocked(key, v, expireAt)
+	return nil
+}

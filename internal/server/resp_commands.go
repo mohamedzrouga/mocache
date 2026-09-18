@@ -81,6 +81,12 @@ func init() {
 	register(&cmdSpec{name: "READONLY", arity: 1, run: cmdReadonly})
 	register(&cmdSpec{name: "READWRITE", arity: 1, run: cmdReadwrite})
 	register(&cmdSpec{name: "CLUSTER", arity: -2, run: cmdCluster})
+	register(&cmdSpec{name: "ASKING", arity: 1, run: cmdAsking})
+	// MIGRATE declares no key positions on purpose: it is addressed to the node
+	// that owns the slot, not routed by the key it names, and the KEYS form
+	// leaves argument 3 empty. Routing it would redirect the very command an
+	// operator sent to a specific node.
+	register(&cmdSpec{name: "MIGRATE", arity: -6, write: true, run: cmdMigrate})
 	register(&cmdSpec{name: "WAIT", arity: 3, run: cmdWait})
 	register(&cmdSpec{name: "REPLICAOF", arity: 3, run: cmdReplicaOf})
 	register(&cmdSpec{name: "SLAVEOF", arity: 3, run: cmdReplicaOf})

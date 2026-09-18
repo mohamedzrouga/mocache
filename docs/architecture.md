@@ -52,6 +52,8 @@ Go and Python must keep the same:
 2. MD5 digest interpreted as a big-endian unsigned integer
 3. Owner = first ring position **at or after** the key hash (bisect_left), wrapping to 0
 
+An SDK can instead be given a **slot map** and route by CRC16 exactly as a Redis cluster client does, which is the only way one keyspace is reachable from both the SDK and the RESP port — see [sdk.md](sdk.md#routing-ring-or-slots) and [cluster.md](cluster.md#two-routing-schemes-one-cache). The ring above remains the default and is what applies when no slot map is configured.
+
 ## Failure model
 
 | Event | What clients see | What to do |

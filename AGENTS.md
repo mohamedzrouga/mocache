@@ -6,7 +6,7 @@ Working notes for coding agents in this repo. Humans: [README.md](README.md) and
 
 MoCache is a memcached-style cache built in-house because Redis/Valkey and other third-party cache products are not an option here. **Nodes are dumb, clients are smart**: each node is an independent LRU process with no knowledge of any other node, and the client picks which node owns a key. No replication, no persistence, no membership protocol — yet. A node restart loses its shard, which the cache design accepts because the data is recomputable.
 
-Since the Redis-compatibility work, a node serves three front ends over one LRU: HTTP, unary RPC, and **RESP on :6379** for stock Redis clients, with Redis Cluster slot routing and `MOVED` redirects. Nodes also gossip over a private cluster bus, replicate primary to replica, and promote a replica by majority vote when a primary dies ([docs/cluster.md](docs/cluster.md)). Live slot migration is still missing.
+Since the Redis-compatibility work, a node serves three front ends over one LRU: HTTP, unary RPC, and **RESP on :6379** for stock Redis clients, with Redis Cluster slot routing and `MOVED` redirects. Nodes also gossip over a private cluster bus, replicate primary to replica, promote a replica by majority vote when a primary dies, and move slots between live nodes with `CLUSTER SETSLOT` / `MIGRATE` / `-ASK` ([docs/cluster.md](docs/cluster.md)).
 
 ```
 cmd/mocache          cache-node server (flags, drain, wiring)
@@ -38,13 +38,15 @@ lab/                 MinIO + FastAPI + benchmark scenario, and the Redis client
 4. **A cache miss is not an error.** HTTP `/get` returns 404, the Go SDK returns `(nil, false, nil)`, the Python SDK returns `None`. Only network and timeout failures raise `OpError` / `MoCacheError`. Do not "improve" this into an exception.
 5. **The node cannot be allowed to OOM.** Every path into memory is capped: item count, total bytes, per-value, per-key, 1 MiB HTTP body, 4 MiB RPC frame, and `debug.SetMemoryLimit`. Adding a new way to store or buffer bytes means adding its cap too.
 6. **Observability never blocks the cache.** The OTLP queue is bounded at 256 and drops spans rather than waiting on a collector. Keep it that way.
-7. **CRC16 must stay CRC-16/XMODEM.** `internal/cluster` hashes keys exactly as Redis does; the check value over `"123456789"` is `0x31C3` and is asserted in the tests. Every Redis client computes slots itself, so a change here does not produce an error — it produces silent misrouting.
+7. **CRC16 must stay CRC-16/XMODEM, in all three implementations.** `internal/cluster/slots.go`, `sdk/go/slots.go` and `sdk/python/mocache/client.py` each hash keys exactly as Redis does; the check value over `"123456789"` is `0x31C3` and all three assert it, plus a shared table of key→slot vectors. Every Redis client computes slots itself, so a change here does not produce an error — it produces silent misrouting.
 8. **Routing decisions happen before execution.** A command that belongs to another node must return `MOVED` without touching the LRU. Adding a command means giving it correct `first`/`last`/`step` key positions in the table in `internal/server/resp_commands.go`; that table also generates the `COMMAND` reply, so the two cannot drift.
 9. **RESP read-modify-write commands are atomic.** `INCR`, `APPEND`, `SET NX`, `GETDEL` and friends run as one critical section in `internal/cache/ops.go`. Do not reimplement them as Get-then-Set in the server: concurrent clients would lose updates.
 10. **One vote per epoch, majority to promote, highest config epoch wins.** These three rules in `internal/cluster/manager.go` are the only thing preventing two nodes from owning one slot. Do not add a shortcut that promotes without votes (except `CLUSTER FAILOVER TAKEOVER`, which is explicitly the operator accepting that risk), and never let a claim win on an equal epoch.
-11. **The cache lock is held while mutations are emitted.** `cache.emit` runs under `c.mu` so the replicated order is exactly the applied order. Anything hanging off it must be non-blocking: `repl.Primary.Observe` appends to a bounded ring and does non-blocking channel sends, and a replica that cannot keep up is dropped to resynchronise. Never do I/O there.
-12. **Replicate effects and absolute expiry times.** `INCR` ships as the resulting value, not as an instruction to increment, and TTLs travel as absolute instants. Both rules exist so a replica that has drifted cannot compound the drift.
-13. **Anything blocking on a socket needs a wake-up path that is not a write.** A streaming goroutine sitting in a `select` will not notice a closed connection until it next writes; that once made shutdown take five seconds. The ack reader closes a `gone` channel for exactly this reason.
+11. **Slot claims are set arithmetic, never wholesale.** A node that loses *some* of its slots — which is what a reshard does — keeps the rest and stays a primary; only a node left with none becomes a replica. `claimSlotsLocked` and `checkSelfDemotionLocked` in `internal/cluster/manager.go` both subtract; voiding a whole claim because one slot moved would take a whole shard offline.
+12. **A reshard's markers are local; only the commit travels.** `MIGRATING`/`IMPORTING` live on the two nodes involved and carry no config epoch, so an abandoned migration leaves no trace. `CLUSTER SETSLOT ... NODE` on the *importing* node is the one step that raises a config epoch, and that is what reaches everyone else. Do not gossip the markers.
+13. **The cache lock is held while mutations are emitted.** `cache.emit` runs under `c.mu` so the replicated order is exactly the applied order. Anything hanging off it must be non-blocking: `repl.Primary.Observe` appends to a bounded ring and does non-blocking channel sends, and a replica that cannot keep up is dropped to resynchronise. Never do I/O there.
+14. **Replicate effects and absolute expiry times.** `INCR` ships as the resulting value, not as an instruction to increment, and TTLs travel as absolute instants. Both rules exist so a replica that has drifted cannot compound the drift.
+15. **Anything blocking on a socket needs a wake-up path that is not a write.** A streaming goroutine sitting in a `select` will not notice a closed connection until it next writes; that once made shutdown take five seconds. The ack reader closes a `gone` channel for exactly this reason.
 
 ## Conventions
 
@@ -83,6 +85,8 @@ Large integers in Helm values render as `2.68435456e+08` unless passed through `
 | Change | Also do this |
 |---|---|
 | Ring, hash, or vnode default | Both SDKs, both test suites, `docs/architecture.md` |
+| SDK slot routing (CRC16, hash tags, the slot map) | Both SDKs, and the shared vectors in `sdk/go/slots_test.go` and `sdk/python/tests/test_slots.py` — they must agree with each other *and* with `internal/cluster`, or one access path reads another's writes as misses |
+| Resharding | `internal/cluster/reshard.go`, `internal/server/resp_cluster.go` and `resp_migrate.go`, the reshard scenarios in `internal/cluster/sim_scenarios_test.go`, `docs/cluster.md`, then `make compat` |
 | A RESP command | The table in `internal/server/resp_commands.go` (arity + key positions), `internal/server/resp_test.go`, the command list in `docs/redis.md` |
 | Cluster routing or `CLUSTER` replies | `internal/cluster`, `internal/server/resp_cluster.go`, `docs/cluster.md`, and re-run `make compat` — the real clients are the test that matters |
 | A new cache operation | `internal/cache/ops.go` under one lock, with byte accounting and the size caps; if it changes stored data, make sure it emits a mutation |
@@ -104,8 +108,8 @@ The lab is disposable: nothing in it is shipped, and breaking it is cheap. Break
 
 The original design ruled out replication, membership and persistence. That decision has been **partly reversed by the project owner**:
 
-- **Done:** Redis-protocol compatibility, Redis Cluster sharding, replication, gossip failure detection, failover by majority vote among primaries, and a deterministic partition simulation (`internal/cluster/sim_test.go`). Bus framing is ours, not Redis's — clients must be compatible, other servers never will be.
-- **Next, in `docs/cluster.md`:** live slot migration (`CLUSTER SETSLOT`, `MIGRATE`, `-ASK`) and replica migration.
+- **Done:** Redis-protocol compatibility, Redis Cluster sharding, replication, gossip failure detection, failover by majority vote among primaries, a deterministic partition simulation (`internal/cluster/sim_test.go`), live slot migration, and replica migration. Bus framing is ours, not Redis's — clients must be compatible, other servers never will be.
+- **Next:** automatic rebalancing (deciding *which* slots should move; the moving itself works), and chained replication.
 - **Planned separately:** a native graph engine with GraphQL. It does not belong in the cache node: LRU eviction and TTL would silently corrupt query results, and a graph's data is not recomputable, so it needs durability the cache deliberately lacks. It should be its own binary in this repo, reusing the cluster layer.
 
 Still out of scope: depending on an external cache product, and adding persistence to the **cache** node. Replication buys availability, not durability: a restarted node comes back empty and refills from its primary, and `WAIT` is how a client learns whether a write reached a replica before the primary died.

@@ -32,6 +32,21 @@ type Runtime interface {
 	MasterOffset() uint64
 	// Replicate turns this node into a replica of another (CLUSTER REPLICATE).
 	Replicate(nodeID string) error
+	// MigrateKeys hands keys to the node at addr (its announce address) over
+	// the cluster bus, and reports whether it took them. It is the transport
+	// half of MIGRATE; CLUSTER SETSLOT is the routing half.
+	MigrateKeys(addr string, keys []MigratedKey, replace bool, timeout time.Duration) error
+}
+
+// MigratedKey is one key handed to another node by MIGRATE.
+//
+// Expiry travels as an absolute instant for the same reason it does in
+// replication: a relative TTL would restart its clock on arrival, and the key
+// would outlive the copy it replaced by the length of the migration.
+type MigratedKey struct {
+	Key      string
+	Value    []byte
+	ExpireAt time.Time
 }
 
 // ReplicaStatus is one connected replica.
@@ -183,7 +198,10 @@ type respConn struct {
 	libVer   string
 	authed   bool
 	readonly bool
-	quit     bool
+	// asking is set by ASKING and cleared after the next command. It is what
+	// lets a client reach a slot this node is importing but does not yet own.
+	asking bool
+	quit   bool
 }
 
 func (s *RESPServer) serveConn(nc net.Conn) {
@@ -242,11 +260,20 @@ func (c *respConn) dispatch(args [][]byte) bool {
 		c.w.Errorf("ERR wrong number of arguments for '%s' command", strings.ToLower(name))
 		return true
 	}
+	// ASKING covers exactly one following command, so it is consumed here
+	// whatever that command turns out to be — including one that is redirected
+	// away, or the flag would leak into the next unrelated command.
+	if name != "ASKING" {
+		defer func() { c.asking = false }()
+	}
 	// Route before executing: a redirect must not have side effects.
 	if code, msg := c.route(spec, args); code != routeLocal {
 		c.w.Error(msg)
-		if code == routeMoved {
+		switch code {
+		case routeMoved:
 			obs.RecordMoved()
+		case routeAsk:
+			obs.RecordAsk()
 		}
 		return true
 	}
@@ -258,6 +285,8 @@ type routeCode int
 const (
 	routeLocal routeCode = iota
 	routeMoved
+	routeAsk
+	routeTryAgain
 	routeCrossSlot
 	routeDown
 )
@@ -280,22 +309,62 @@ func (c *respConn) route(spec *cmdSpec, args [][]byte) (routeCode, string) {
 			return routeCrossSlot, "CROSSSLOT Keys in request don't hash to the same slot"
 		}
 	}
-	if c.s.view().Mine(slot) {
+	t := c.s.view()
+	if t.Mine(slot) {
+		if dest := t.Migrating(slot); dest != "" {
+			return c.routeMigrating(t, slot, dest, keys)
+		}
 		return routeLocal, ""
 	}
-	owner := c.s.view().OwnerOf(slot)
+	// A slot arriving here is not ours yet, so it is served only for a client
+	// that was sent here by an ASK and said ASKING. Everyone else is pointed
+	// back at the node that still owns it.
+	if t.Importing(slot) != "" && c.asking {
+		return routeLocal, ""
+	}
+	owner := t.OwnerOf(slot)
 	if owner == nil {
 		return routeDown, "CLUSTERDOWN Hash slot not served"
 	}
 	// A replica may serve its primary's slots for reads once the client has
 	// sent READONLY; writes always go to the primary.
 	if c.readonly && !spec.write {
-		me := c.s.view().Myself()
+		me := t.Myself()
 		if me.Role == cluster.RoleReplica && me.PrimaryO == owner.Addr() {
 			return routeLocal, ""
 		}
 	}
 	return routeMoved, "MOVED " + itoa(slot) + " " + owner.Addr()
+}
+
+// routeMigrating decides who serves a key in a slot that is on its way out.
+//
+// A key that is still here is served here; a key that has already been copied
+// across is answered with ASK, which sends the client to the destination for
+// this one command without telling it the slot has moved — the slot map is
+// still correct until SETSLOT NODE commits. A multi-key command that straddles
+// the two halves cannot be served correctly by either node, so it is refused
+// with TRYAGAIN rather than answered from half the data.
+func (c *respConn) routeMigrating(t *cluster.Topology, slot int, destID string, keys [][]byte) (routeCode, string) {
+	present := 0
+	for _, k := range keys {
+		if c.s.cache.Exists(string(k)) {
+			present++
+		}
+	}
+	if present == len(keys) {
+		return routeLocal, ""
+	}
+	if present > 0 {
+		return routeTryAgain, "TRYAGAIN Multiple keys request during rehashing of slot"
+	}
+	dest := nodeByID(t, destID)
+	if dest == nil {
+		// The destination left the cluster mid-reshard. Serving locally is the
+		// safe answer: we still own the slot, and a miss is not a wrong answer.
+		return routeLocal, ""
+	}
+	return routeAsk, "ASK " + itoa(slot) + " " + dest.Addr()
 }
 
 func isClosedConn(err error) bool {

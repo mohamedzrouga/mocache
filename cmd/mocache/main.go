@@ -61,6 +61,7 @@ func main() {
 	busAddr := flag.String("cluster-bus-addr", "", "cluster bus listen address; default is the RESP port + 10000")
 	nodeTimeout := flag.Duration("cluster-node-timeout", 5*time.Second, "peer silence before it is suspected; failover timings derive from this")
 	failoverDelay := flag.Duration("cluster-failover-delay", 500*time.Millisecond, "base wait before a replica stands for election")
+	replicaMigration := flag.Bool("cluster-replica-migration", true, "let a spare replica move to a shard that has none, so one crash cannot leave a shard unable to fail over")
 	replBacklog := flag.Int64("repl-backlog-bytes", 32<<20, "replication backlog per primary; a replica that falls further behind resynchronises")
 	capacity := flag.Int("capacity", 100_000, "maximum number of cached items")
 	maxBytes := flag.Int64("max-bytes", 64<<20, "approximate max bytes of keys+values+overhead")
@@ -129,6 +130,7 @@ func main() {
 				NodeTimeout:      *nodeTimeout,
 				FailoverDelay:    *failoverDelay,
 				ReplBacklogBytes: *replBacklog,
+				ReplicaMigration: *replicaMigration,
 			})
 			if err := runtime.Start(); err != nil {
 				slog.Error("cluster bus", "err", err)

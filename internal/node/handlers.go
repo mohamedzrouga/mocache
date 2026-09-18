@@ -98,6 +98,9 @@ func (c *Cluster) Serve(f bus.Frame) bus.Frame {
 		}
 		return ack()
 
+	case bus.TypeMigrate:
+		return c.applyMigrated(f)
+
 	case bus.TypeHello:
 		return ack()
 	}

@@ -44,13 +44,21 @@ func (l *Link) Connected() bool {
 // Do sends a frame and waits for the reply. On any I/O error the connection is
 // dropped and retried once, so a peer restart costs one failed call rather than
 // a permanently dead link.
-func (l *Link) Do(f Frame) (Frame, error) {
+func (l *Link) Do(f Frame) (Frame, error) { return l.DoTimeout(f, l.timeout) }
+
+// DoTimeout bounds one exchange by a caller-supplied deadline instead of the
+// link's. MIGRATE carries its own timeout and can ship a batch of keys that
+// legitimately outlasts the gossip timeout this link was built with.
+func (l *Link) DoTimeout(f Frame, timeout time.Duration) (Frame, error) {
+	if timeout <= 0 {
+		timeout = l.timeout
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.closed {
 		return Frame{}, ErrClosed
 	}
-	reply, err := l.doLocked(f)
+	reply, err := l.doLocked(f, timeout)
 	if err == nil {
 		return reply, nil
 	}
@@ -58,19 +66,19 @@ func (l *Link) Do(f Frame) (Frame, error) {
 		return Frame{}, err
 	}
 	l.resetLocked()
-	return l.doLocked(f)
+	return l.doLocked(f, timeout)
 }
 
-func (l *Link) doLocked(f Frame) (Frame, error) {
+func (l *Link) doLocked(f Frame, timeout time.Duration) (Frame, error) {
 	if l.conn == nil {
-		conn, err := net.DialTimeout("tcp", l.addr, l.timeout)
+		conn, err := net.DialTimeout("tcp", l.addr, timeout)
 		if err != nil {
 			return Frame{}, err
 		}
 		l.conn = conn
 		l.r = bufio.NewReaderSize(conn, 32<<10)
 	}
-	deadline := time.Now().Add(l.timeout)
+	deadline := time.Now().Add(timeout)
 	_ = l.conn.SetDeadline(deadline)
 	if err := Write(l.conn, f); err != nil {
 		return Frame{}, err

@@ -36,6 +36,7 @@ var (
 	respErrs  atomic.Uint64
 	respConns atomic.Int64
 	respMoved atomic.Uint64
+	respAsk   atomic.Uint64
 	respSumNs atomic.Uint64
 
 	// Replication, published on a timer by cmd/mocache.
@@ -101,6 +102,13 @@ func RecordRESP(dur time.Duration, err bool) {
 // a stale slot map — the first thing to look at after a topology change.
 func RecordMoved() { respMoved.Add(1) }
 
+// RecordAsk counts an ASK redirect, which means a key has already moved to the
+// slot's new home while the reshard is still running. Unlike MOVED it is
+// expected to be non-zero only while a reshard is in progress, and to stop when
+// it finishes — a steady rate afterwards means a migration was never committed
+// with CLUSTER SETSLOT NODE.
+func RecordAsk() { respAsk.Add(1) }
+
 // RESPConns tracks open Redis-protocol connections.
 func RESPConns(delta int64) { respConns.Add(delta) }
 
@@ -151,6 +159,7 @@ func WritePrometheus(w io.Writer, st cache.Stats) {
 	p("# HELP mocache_resp_commands_total Redis-protocol commands handled.\n# TYPE mocache_resp_commands_total counter\nmocache_resp_commands_total %d\n", respCmds.Load())
 	p("# HELP mocache_resp_errors_total Redis-protocol error replies (including redirects).\n# TYPE mocache_resp_errors_total counter\nmocache_resp_errors_total %d\n", respErrs.Load())
 	p("# HELP mocache_resp_moved_total MOVED redirects sent; a rising rate means stale client slot maps.\n# TYPE mocache_resp_moved_total counter\nmocache_resp_moved_total %d\n", respMoved.Load())
+	p("# HELP mocache_resp_ask_total ASK redirects sent during a live slot migration.\n# TYPE mocache_resp_ask_total counter\nmocache_resp_ask_total %d\n", respAsk.Load())
 	p("# HELP mocache_resp_connections Open Redis-protocol connections.\n# TYPE mocache_resp_connections gauge\nmocache_resp_connections %d\n", respConns.Load())
 	p("# HELP mocache_resp_duration_seconds_sum Total time spent executing Redis-protocol commands.\n# TYPE mocache_resp_duration_seconds_sum counter\nmocache_resp_duration_seconds_sum %s\n", strconv.FormatFloat(float64(respSumNs.Load())/1e9, 'f', 6, 64))
 	p("# HELP mocache_cluster_enabled 1 when the node serves a slot range.\n# TYPE mocache_cluster_enabled gauge\nmocache_cluster_enabled %d\n", boolGauge(clusterOn.Load()))

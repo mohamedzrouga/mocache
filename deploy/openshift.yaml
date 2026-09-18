@@ -75,6 +75,9 @@ spec:
             - -resp=:6379
             - -cluster-announce=$(POD_NAME).cache-headless:6379
             - -cluster-node-timeout=5s
+            # Every shard here has exactly one replica, so there is no spare to
+            # move; set explicitly so adding one later has the intended effect.
+            - -cluster-replica-migration=true
             - -cluster-peer=cache-0.cache-headless:6379=0-5460
             - -cluster-peer=cache-1.cache-headless:6379=5461-10921
             - -cluster-peer=cache-2.cache-headless:6379=10922-16383

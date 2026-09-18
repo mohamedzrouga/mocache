@@ -686,6 +686,43 @@ func (s *sim) restart(addr string) {
 	s.after(time.Duration(s.rnd.Int63n(int64(s.opt.pingInterval))), n.tick)
 }
 
+// reshard opens a slot migration the way redis-cli drives it: IMPORTING on the
+// destination, MIGRATING on the source. Nothing moves yet — the two markers
+// only change who answers for keys that are or are not there, and the
+// simulation has no keys. What it does model is the window in which two nodes
+// are both party to one slot.
+func (s *sim) reshard(slot int, fromAddr, toAddr string) {
+	src, dst := s.byID[fromAddr], s.byID[toAddr]
+	if src == nil || dst == nil {
+		s.t.Fatalf("reshard: unknown node %q or %q", fromAddr, toAddr)
+	}
+	if err := dst.mgr.SetSlotImporting(slot, src.id); err != nil {
+		s.logf("reshard %d: importing refused: %v", slot, err)
+		return
+	}
+	if err := src.mgr.SetSlotMigrating(slot, dst.id); err != nil {
+		s.logf("reshard %d: migrating refused: %v", slot, err)
+		return
+	}
+	s.logf("RESHARD slot %d  %s -> %s", slot, src.short(), dst.short())
+}
+
+// commitReshard closes the window: the destination takes the slot at a raised
+// config epoch, and the source gives it up. Everyone else finds out by gossip,
+// the same way they find out about a failover.
+func (s *sim) commitReshard(slot int, fromAddr, toAddr string) {
+	src, dst := s.byID[fromAddr], s.byID[toAddr]
+	if err := dst.mgr.SetSlotOwner(slot, dst.id); err != nil {
+		s.logf("reshard %d: commit on destination refused: %v", slot, err)
+		return
+	}
+	if err := src.mgr.SetSlotOwner(slot, dst.id); err != nil {
+		s.logf("reshard %d: commit on source refused: %v", slot, err)
+	}
+	s.logf("RESHARD COMMIT slot %d -> %s at epoch %d",
+		slot, dst.short(), dst.mgr.View().Myself().ConfigEpoch)
+}
+
 // --- reporting -------------------------------------------------------------
 
 func (s *sim) logf(format string, a ...any) {
@@ -846,6 +883,18 @@ func (s *sim) converged() (bool, string) {
 		v := n.mgr.View()
 		if v.AssignedSlots() != SlotCount {
 			return false, fmt.Sprintf("%s sees %d/%d slots assigned", n.short(), v.AssignedSlots(), SlotCount)
+		}
+		// What a cluster client actually validates: the advertised ranges must
+		// sum to exactly 16384. Two nodes each still listing a slot they no
+		// longer share pushes this over, and go-redis rejects the topology
+		// outright rather than picking one.
+		advertised := 0
+		for _, p := range v.Primaries() {
+			advertised += p.SlotsCount()
+		}
+		if advertised != SlotCount {
+			return false, fmt.Sprintf("%s advertises %d slots across its primaries, want %d",
+				n.short(), advertised, SlotCount)
 		}
 		owners := s.ownerSummary(v)
 		if refNode == nil {

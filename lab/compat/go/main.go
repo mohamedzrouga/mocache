@@ -200,7 +200,11 @@ func keyspace(ctx context.Context, c client) {
 func clusterTopology(ctx context.Context, c *redis.ClusterClient) {
 	fmt.Println("cluster")
 	slots, err := c.ClusterSlots(ctx).Result()
-	checkTrue("cluster slots parsed", err == nil && len(slots) == 3, len(slots))
+	// Not a fixed count: a resharded cluster legitimately advertises more
+	// ranges than it has shards, because moving one slot splits a range. What
+	// must hold is that they sum to exactly 16384, checked next — that is the
+	// condition go-redis itself enforces before it will use the topology.
+	checkTrue("cluster slots parsed", err == nil && len(slots) >= 3, len(slots))
 	covered := 0
 	for _, s := range slots {
 		covered += s.End - s.Start + 1

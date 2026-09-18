@@ -17,6 +17,7 @@ MoCache nodes are **stateless**. Restarts, crashes, and rolling upgrades always 
 | `-cluster-bus-addr` | *(derived)* | Override the bus listen address |
 | `-cluster-node-timeout` | `5s` | Peer silence before it is suspected |
 | `-cluster-failover-delay` | `500ms` | Base wait before a replica stands for election |
+| `-cluster-replica-migration` | `true` | Let a spare replica move to a shard that has none |
 | `-repl-backlog-bytes` | `32Mi` | Replication backlog per primary |
 | `-capacity` | `100000` | Max items (LRU evicts beyond this) |
 | `-max-bytes` | `64Mi` | Max approximate payload bytes |

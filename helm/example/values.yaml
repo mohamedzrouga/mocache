@@ -71,6 +71,10 @@ resp:
     bus: true
     nodeTimeout: 5s
     failoverDelay: 500ms
+    # Move a spare replica to a shard that has lost all of its own, so one
+    # crash cannot leave a shard unable to fail over. Needs replicasPerShard > 1
+    # somewhere in the cluster to have a spare to move.
+    replicaMigration: true
     backlogBytes: 33554432
 
 service:
